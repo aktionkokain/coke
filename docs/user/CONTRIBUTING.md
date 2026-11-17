@@ -20,6 +20,15 @@ Read [FINDINGS.md](../ai/FINDINGS.md) before changing engine-facing code. It
 records what has been verified, which pieces are build-specific, and the safety
 rules (fault-safe reads, re-validate before writing, prefer RTTI over geometry).
 
+## Build Profiles.
+Build profiles take the shape of a folder named like the corresponding executable of the game eg. /CM Black Sea.exe,
+with a vendor tag eg. steam-32.ini, the .ini is populated according to the [README.md](/profiles/README.md)
+
+To upload a profile, either make a simple pull request with the profile, or an issue, or email me directly on aktionkokain@gmail.com
+
+To build a profile for FREE, read [DEVELOPING.md](/docs/user/DEVELOPING.md)
+
+
 ## Checks
 
 Run these before opening a pull request:
