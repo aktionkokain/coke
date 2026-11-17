@@ -1,0 +1,18 @@
+[package]
+name = "coke-fps"
+version = "0.1.0"
+edition = "2024"
+description = "Sample coke/ mod: red FPS counter in the top-left corner"
+
+[lib]
+name = "coke_fps"
+crate-type = ["cdylib"]
+
+[dependencies]
+coke-host = { path = "../../crates/coke-host" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1

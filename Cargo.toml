@@ -1,0 +1,34 @@
+[package]
+name = "coke"
+version = "0.1.0"
+edition = "2024"
+# #[unsafe(naked)] and naked_asm! are stable since Rust 1.88.
+rust-version = "1.88"
+description = "Drop-in opengl32.dll proxy for the Combat Mission series: windowed mode, UI re-layout and a native mod loader"
+repository = "https://github.com/aktionkokain/coke"
+readme = "README.md"
+license = "MIT"
+keywords = ["combat-mission", "opengl32", "proxy", "modding", "windows"]
+categories = ["games", "development-tools::debugging"]
+
+[lib]
+name = "opengl32"
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = false
+
+[profile.dev]
+panic = "abort"
+
+[dependencies]
+# Host ABI shared with the native mods. One definition of `CokeHost` so the
+# proxy and every mod cannot drift apart.
+coke-host = { path = "crates/coke-host" }
+# Reading the drag-and-drop PROFILES.zip. Deflate only; no compression or
+# encryption support is needed for a release bundle.
+zip = { version = "9.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }

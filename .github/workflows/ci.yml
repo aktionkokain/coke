@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (32-bit MSVC target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: |
+          cargo fmt --check
+          cargo fmt --check --manifest-path crates/coke-host/Cargo.toml
+
+      - name: No hard-coded engine addresses
+        shell: pwsh
+        run: ./scripts/check-no-engine-addresses.ps1
+
+      - name: Clippy
+        run: |
+          cargo clippy --all-targets --release -- -D warnings
+          cargo clippy --manifest-path crates/coke-host/Cargo.toml -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build proxy (release)
+        run: cargo build --release
+
+      - name: Build sample mods
+        shell: pwsh
+        run: |
+          Push-Location mods/coke-fps
+          cargo clippy --release -- -D warnings
+          cargo build --release
+          Pop-Location
+          Push-Location mods/coke-los
+          cargo clippy --release -- -D warnings
+          cargo build --release
+          Pop-Location
+          Push-Location mods/coke-prof
+          cargo clippy --release -- -D warnings
+          cargo build --release
+          Pop-Location
