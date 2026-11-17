@@ -14,6 +14,7 @@ Resizable window, borderless `F11` fullscreen, live UI re-layout, alt-tab withou
 
 > [!WARNING]
 > This project is work in progress. Downloading it right now will probably not work on your install: every build needs a matching profile. If you have access to agents, read [DEVELOPING.md](docs/user/DEVELOPING.md) to create a profile for your install. Please submit the resulting profile.
+
 </div>
 
 <div align="center">
