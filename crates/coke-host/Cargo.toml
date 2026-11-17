@@ -1,0 +1,7 @@
+[package]
+name = "coke-host"
+version = "0.1.0"
+edition = "2024"
+description = "Shared host ABI between the Coke proxy and its native mods"
+license = "MIT"
+publish = false

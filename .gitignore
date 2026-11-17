@@ -1,0 +1,42 @@
+target/
+
+# Local logs and editor/OS noise
+*.log
+*.bak
+*.bak-*
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Built binaries. dist/ is the only place they are published, see below.
+*.pdb
+*.lib
+*.exp
+*.dll
+*.zip
+!dist/**/*.dll
+!dist/**/*.zip
+
+# Reverse-engineering output. Keep game code, memory dumps and extracted
+# assets out of the public repo; see docs/ai/DECOMPILING.md.
+analysis/
+decompiled/
+ghidra-project/
+*.brz
+cmbs-*.bin
+*.c
+!src/**/*.c
+
+# Runtime mod folder created next to the game EXE
+coke/
+
+# Local working notes, never part of a release
+docs/scratchpad.md
+docs/rea.md
+docs/meta/ISSUES.md
+
+# dist\ is tracked on purpose: README.md and docs/user/INSTALL.md link straight
+# to dist/PROFILES.zip, and that same zip is uploaded to releases. Only drop-in
+# release artifacts belong here; compiler output stays in target/.
+/dist/staging/

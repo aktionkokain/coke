@@ -1,0 +1,4 @@
+# The proxy must be 32-bit: CM Black Sea is a 32-bit process and a 64-bit
+# opengl32.dll cannot be loaded into it.
+[build]
+target = "i686-pc-windows-msvc"

@@ -1,0 +1,41 @@
+name: release
+
+# Builds the proxy and the default mods, then publishes a GitHub release with the
+# release layout from scripts/package.ps1: the proxy DLL, the default config, one
+# PROFILES.zip with every game title's profiles, and coke-mods.zip (dist\mods).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (32-bit MSVC target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+
+      # package.ps1 builds the proxy and every default mod for i686 before it
+      # stages dist\, so a fresh runner has the mod DLLs it needs.
+      - name: Build release layout
+        shell: pwsh
+        run: ./scripts/package.ps1
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $modsZip = Join-Path $env:RUNNER_TEMP "coke-mods.zip"
+          Compress-Archive -Path (Join-Path $PWD "dist/mods/*") -DestinationPath $modsZip -Force
+          $assets = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }) + $modsZip
+          gh release create $tag $assets --title $tag --generate-notes
