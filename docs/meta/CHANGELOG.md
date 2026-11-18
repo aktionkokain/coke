@@ -8,6 +8,19 @@ Release notes for the Coke proxy.
 
 ---
 
+## 0.1.1
+
+- Easier window resize: `resize_border` gives each client edge a wider grab
+  area, and holding `resize_modifier` (default `ctrl_shift`) resizes the game
+  view from the nearest third of the window. Resizing never moves the window
+  and does not apply to borderless F11 fullscreen.
+- `freeze_pan_while_dragging` keeps the engine from edge-scrolling the battle
+  camera while the window is being dragged or resized.
+- Automatic update reminder: with `[update] check_updates` the proxy asks once
+  before contacting GitHub, checks the public release list once per launch and
+  offers Download / Ignore this version / Never check again. It never downloads
+  or installs anything; Download opens the releases page in the browser.
+
 ## 0.1.0
 
 Initial public release.
