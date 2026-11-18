@@ -66,7 +66,7 @@ Or donate for a profile: [Donate](docs/DONATIONS.md)
 | Cold War | Steam 32-bit | none | no profile yet |
 | Shock Force 2 | [GOG 32-bit](profiles/CM%20Shock%20Force%202.exe/gog-32.ini) | verified |
 | Shock Force 2 | Steam 32-bit | none | 
-| Battle for Normany | [Battlefront 32-bit](profiles/CM%20Normandy.exe/battlefront-32.ini) | community, partial |
+| Battle for Normandy | [Battlefront 32-bit](profiles/CM%20Normandy.exe/battlefront-32.ini) | community, partial |
 
 
 </div>
