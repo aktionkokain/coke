@@ -110,6 +110,15 @@ pub static CLOSE_LOGGED: AtomicU32 = AtomicU32::new(0);
 /// Window mode last applied by the mod:
 /// 0 = framed window, 1 = borderless fullscreen, 2 = maximised framed window.
 pub static WINDOW_MODE: AtomicU32 = AtomicU32::new(0);
+/// Set between `WM_ENTERSIZEMOVE` and `WM_EXITSIZEMOVE`, i.e. while the user is
+/// moving or resizing the window with the mouse.
+pub static WINDOW_DRAGGING: AtomicU32 = AtomicU32::new(0);
+/// Last cursor sample that was inside the client area, in physical client
+/// coordinates (see `pack_point`). While a window drag is in progress the
+/// cursor hook reports this point instead of the live one, so the engine does
+/// not pan the camera at the window edge.
+pub static DRAG_ANCHOR: AtomicIsize = AtomicIsize::new(0);
+pub static DRAG_ANCHOR_VALID: AtomicU32 = AtomicU32::new(0);
 /// Set once the initial mode has been applied to the current engine window.
 pub static INITIAL_MODE_DONE: AtomicU32 = AtomicU32::new(0);
 /// Last framed-window rectangle, restored when leaving borderless fullscreen.

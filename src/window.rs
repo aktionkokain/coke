@@ -470,6 +470,30 @@ pub fn pack_point(x: i32, y: i32) -> isize {
     (((y as u16 as usize) << 16) | (x as u16 as usize)) as isize
 }
 
+/// Inverse of [`pack_point`].
+pub fn unpack_point(packed: isize) -> (i32, i32) {
+    (
+        (packed & 0xffff) as i16 as i32,
+        ((packed >> 16) & 0xffff) as i16 as i32,
+    )
+}
+
+/// Keep a frozen cursor position away from the window edges.
+///
+/// The engine pans the camera when the cursor is near a client edge. While the
+/// user is dragging the window the real cursor sits on the frame, so the cursor
+/// hook substitutes the last in-client sample; clamping that sample inward by
+/// roughly 10% (16-64 px) guarantees it is outside the engine's edge-scroll
+/// band even after the window has been resized much smaller.
+pub fn pan_guard_point(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    if w <= 0 || h <= 0 {
+        return (x, y);
+    }
+    let mx = (w / 10).clamp(16, 64).min((w - 1) / 2);
+    let my = (h / 10).clamp(16, 64).min((h - 1) / 2);
+    (x.clamp(mx, w - 1 - mx), y.clamp(my, h - 1 - my))
+}
+
 /// Convert a physical client coordinate to the logical coordinate space the
 /// engine draws and hit-tests in.
 pub fn client_to_logical(x: i32, y: i32) -> (i32, i32) {
@@ -538,6 +562,94 @@ unsafe fn log_window_manip(what: &str, hwnd: Hwnd, wparam: usize, lparam: isize)
             "{what}: wparam=0x{wparam:x} lparam=0x{:x} client {geom}",
             lparam as usize
         ));
+    }
+}
+
+/// True when the configured resize modifier is held right now.
+unsafe fn resize_modifier_active(mode: u8) -> bool {
+    unsafe {
+        match mode {
+            RESIZE_MODIFIER_CTRL_SHIFT => {
+                GetAsyncKeyState(VK_CONTROL) < 0 && GetAsyncKeyState(VK_SHIFT) < 0
+            }
+            RESIZE_MODIFIER_CTRL => GetAsyncKeyState(VK_CONTROL) < 0,
+            RESIZE_MODIFIER_SHIFT => GetAsyncKeyState(VK_SHIFT) < 0,
+            RESIZE_MODIFIER_ALT => GetAsyncKeyState(VK_MENU) < 0,
+            _ => false,
+        }
+    }
+}
+
+/// Native `HT*` resize code for a client-area hit, or `None` to pass the click
+/// through to the game.
+///
+/// Two layers, both framed-window only:
+/// - a band `resize_border` px inside each edge is always a resize handle, so
+///   the effective border is much fatter than the native frame;
+/// - while `resize_modifier` is held the whole client resizes from the nearest
+///   third (the centre uses the nearest edge), so the window can be resized
+///   without aiming at an edge at all.
+unsafe fn resize_hit(hwnd: Hwnd, lparam: isize) -> Option<isize> {
+    unsafe {
+        let cfg = config();
+        let mut pt = Point {
+            x: (lparam & 0xffff) as i16 as i32,
+            y: ((lparam >> 16) & 0xffff) as i16 as i32,
+        };
+        let mut c = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if ScreenToClient(hwnd, &mut pt) == 0 || GetClientRect(hwnd, &mut c) == 0 {
+            return None;
+        }
+        let (w, h) = (c.right - c.left, c.bottom - c.top);
+        if w <= 0 || h <= 0 || pt.x < 0 || pt.y < 0 || pt.x >= w || pt.y >= h {
+            return None;
+        }
+
+        let (left, top, right, bottom) = if resize_modifier_active(cfg.resize_modifier) {
+            let third_x = w / 3;
+            let third_y = h / 3;
+            let mut left = pt.x < third_x;
+            let mut right = pt.x >= w - third_x;
+            let mut top = pt.y < third_y;
+            let mut bottom = pt.y >= h - third_y;
+            if !left && !right && !top && !bottom {
+                let (dl, dr, dt, db) = (pt.x, w - pt.x, pt.y, h - pt.y);
+                let nearest = dl.min(dr).min(dt).min(db);
+                if nearest == dl {
+                    left = true;
+                } else if nearest == dr {
+                    right = true;
+                } else if nearest == dt {
+                    top = true;
+                } else {
+                    bottom = true;
+                }
+            }
+            (left, top, right, bottom)
+        } else {
+            let band = cfg.resize_border.max(0);
+            if band == 0 {
+                return None;
+            }
+            (pt.x < band, pt.y < band, pt.x >= w - band, pt.y >= h - band)
+        };
+
+        Some(match (top, bottom, left, right) {
+            (true, _, true, _) => HTTOPLEFT,
+            (true, _, _, true) => HTTOPRIGHT,
+            (_, true, true, _) => HTBOTTOMLEFT,
+            (_, true, _, true) => HTBOTTOMRIGHT,
+            (true, _, _, _) => HTTOP,
+            (_, true, _, _) => HTBOTTOM,
+            (_, _, true, _) => HTLEFT,
+            (_, _, _, true) => HTRIGHT,
+            _ => return None,
+        })
     }
 }
 
@@ -618,7 +730,15 @@ pub unsafe extern "system" fn custom_wndproc(
             WM_WINDOWPOSCHANGED => {
                 log_window_manip("WM_WINDOWPOSCHANGED", hwnd, wparam, lparam);
             }
+            WM_ENTERSIZEMOVE => {
+                // Moving or resizing the frame puts the real cursor on the
+                // window edge, which is exactly where the engine's per-frame
+                // cursor poll starts panning the camera. Freeze the reported
+                // position until the gesture ends.
+                WINDOW_DRAGGING.store(1, Ordering::Relaxed);
+            }
             WM_EXITSIZEMOVE => {
+                WINDOW_DRAGGING.store(0, Ordering::Relaxed);
                 // The user finished dragging a window edge. Post one synthetic
                 // WM_MOUSEMOVE so the engine's idle menu loop wakes up and redraws
                 // the now-resized window. Without this the screen stays black until
@@ -643,6 +763,21 @@ pub unsafe extern "system" fn custom_wndproc(
                 InvalidateRect(hwnd, core::ptr::null(), 0);
                 kick_repaint(hwnd);
                 return result;
+            }
+            WM_NCHITTEST => {
+                // Resizing was only possible on the thin native frame. Claim an
+                // inset band just inside every client edge (and, while the
+                // resize modifier is held, the whole client) so Windows runs its
+                // own resize loop with the right cursor. This never moves the
+                // window.
+                let hit = call_original(hwnd, msg, wparam, lparam);
+                if hit == HTCLIENT
+                    && WINDOW_MODE.load(Ordering::Relaxed) != 1
+                    && let Some(code) = resize_hit(hwnd, lparam)
+                {
+                    return code;
+                }
+                return hit;
             }
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN
             | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP
@@ -1011,5 +1146,19 @@ mod tests {
         );
         assert!(canvas_is_plausible(1928, 1086, 1), "1% tolerance");
         assert!(!canvas_is_plausible(1928, 1086, 0));
+    }
+
+    #[test]
+    fn pan_guard_keeps_the_frozen_point_away_from_the_edges() {
+        // A point on the top-left frame is moved inward.
+        let (x, y) = pan_guard_point(-40, -12, 1920, 1080);
+        assert_eq!((x, y), (64, 64));
+        // A point in the middle is untouched.
+        assert_eq!(pan_guard_point(960, 540, 1920, 1080), (960, 540));
+        // Tiny windows still get a valid, in-client point.
+        let (x, y) = pan_guard_point(0, 0, 40, 40);
+        assert!((0..40).contains(&x));
+        assert!((0..40).contains(&y));
+        assert_eq!(pan_guard_point(5, 5, 0, 0), (5, 5), "no size, no clamp");
     }
 }

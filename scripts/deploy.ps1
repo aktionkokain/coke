@@ -44,7 +44,48 @@ if (-not (Test-Path $exePath)) {
 }
 
 Copy-Item $dll (Join-Path $GameDir $names.proxy_dll) -Force
-Copy-Item (Join-Path $root $names.config_file) (Join-Path $GameDir $names.config_file) -Force
+
+# The config carries the update-check state in its [state] section. Keep those
+# key/values across deployments instead of resetting the player's answer, and
+# make sure the installed file has exactly one [state] section.
+$configPath = Join-Path $GameDir $names.config_file
+$state = [ordered]@{}
+if (Test-Path -LiteralPath $configPath) {
+    $inState = $false
+    foreach ($line in Get-Content -LiteralPath $configPath) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '^\[(.+)\]$') {
+            $inState = ($Matches[1].Trim() -ieq 'state')
+            continue
+        }
+        if ($inState -and $trimmed -match '^([A-Za-z0-9_]+)\s*=\s*(.*)$') {
+            $state[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+}
+Copy-Item (Join-Path $root $names.config_file) $configPath -Force
+if ($state.Count -gt 0) {
+    $kept = @()
+    $inState = $false
+    foreach ($line in Get-Content -LiteralPath $configPath) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '^\[(.+)\]$') {
+            $inState = ($Matches[1].Trim() -ieq 'state')
+            if ($inState) { continue }
+        }
+        if ($inState) { continue }
+        $kept += $line
+    }
+    while ($kept.Count -gt 0 -and $kept[-1].Trim() -eq '') {
+        if ($kept.Count -eq 1) { $kept = @(); break }
+        $kept = $kept[0..($kept.Count - 2)]
+    }
+    $block = @('', '[state]', '# Written by Coke. Delete this section to see the update prompt again.')
+    foreach ($key in $state.Keys) { $block += "$key=$($state[$key])" }
+    $kept += $block
+    [IO.File]::WriteAllText($configPath, (($kept -join [Environment]::NewLine) + [Environment]::NewLine))
+    Write-Host "Kept the [state] section in $($names.config_file)"
+}
 Write-Host "Installed $($names.proxy_dll) and $($names.config_file) in $GameDir"
 
 # The profile for this executable. CMBS also ships one embedded, but copying the

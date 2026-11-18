@@ -32,6 +32,34 @@ pub struct Point {
     pub y: i32,
 }
 
+/// `MSG` for the small modal prompt's message loop.
+#[repr(C)]
+pub struct Msg {
+    pub hwnd: Hwnd,
+    pub message: u32,
+    pub wparam: usize,
+    pub lparam: isize,
+    pub time: u32,
+    pub pt: Point,
+    pub private: u32,
+}
+
+/// `WNDCLASSW`. `lpfn_wnd_proc` uses `Option` so a null function pointer has the
+/// same layout as the C field.
+#[repr(C)]
+pub struct WndClassW {
+    pub style: u32,
+    pub lpfn_wnd_proc: Option<unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize>,
+    pub cb_cls_extra: i32,
+    pub cb_wnd_extra: i32,
+    pub h_instance: Hmodule,
+    pub h_icon: Handle,
+    pub h_cursor: Handle,
+    pub hbr_background: Handle,
+    pub lpsz_menu_name: *const u16,
+    pub lpsz_class_name: *const u16,
+}
+
 #[repr(C)]
 pub struct MonitorInfo {
     pub cb_size: u32,
@@ -95,6 +123,19 @@ pub const WS_MAXIMIZEBOX: u32 = 0x0001_0000;
 pub const WS_POPUP: u32 = 0x8000_0000;
 pub const WS_CHILD: u32 = 0x4000_0000;
 pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
+pub const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+pub const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
+pub const WS_EX_CONTROLPARENT: u32 = 0x0001_0000;
+pub const WS_TABSTOP: u32 = 0x0001_0000;
+pub const BS_PUSHBUTTON: u32 = 0x0000_0000;
+pub const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+pub const SS_LEFT: u32 = 0x0000_0000;
+pub const GWLP_USERDATA: i32 = -21;
+pub const DEFAULT_GUI_FONT: i32 = 17;
+pub const IDC_SIZEALL: usize = 32646;
+pub const IDOK: isize = 1;
+pub const IDCANCEL: isize = 2;
+pub const LOGPIXELSX: i32 = 88;
 
 pub const SWP_FRAMECHANGED: u32 = 0x0020;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
@@ -113,10 +154,24 @@ pub const SW_RESTORE: i32 = 9;
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_WINDOWPOSCHANGED: u32 = 0x0047;
 pub const WM_ACTIVATEAPP: u32 = 0x001c;
+pub const WM_ACTIVATE: u32 = 0x0006;
+pub const WA_INACTIVE: u32 = 0;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_TIMER: u32 = 0x0113;
+pub const DT_CALCRECT: u32 = 0x0400;
+pub const DT_WORDBREAK: u32 = 0x0010;
+pub const DT_NOPREFIX: u32 = 0x0800;
+pub const VK_LBUTTON: i32 = 0x01;
+pub const VK_RBUTTON: i32 = 0x02;
+pub const WM_ENTERSIZEMOVE: u32 = 0x0231;
 pub const WM_EXITSIZEMOVE: u32 = 0x0232;
 pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_SYSCOMMAND: u32 = 0x0112;
 pub const WM_NCHITTEST: u32 = 0x0084;
+pub const WM_SETCURSOR: u32 = 0x0020;
+pub const WM_COMMAND: u32 = 0x0111;
+pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_SETFONT: u32 = 0x0030;
 pub const WM_MOUSEMOVE: u32 = 0x0200;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
 pub const WM_LBUTTONUP: u32 = 0x0202;
@@ -138,6 +193,14 @@ pub const SC_RESTORE: usize = 0xF120;
 
 pub const HTCLIENT: isize = 1;
 pub const HTCAPTION: isize = 2;
+pub const HTLEFT: isize = 10;
+pub const HTRIGHT: isize = 11;
+pub const HTTOP: isize = 12;
+pub const HTTOPLEFT: isize = 13;
+pub const HTTOPRIGHT: isize = 14;
+pub const HTBOTTOM: isize = 15;
+pub const HTBOTTOMLEFT: isize = 16;
+pub const HTBOTTOMRIGHT: isize = 17;
 pub const HTMAXBUTTON: isize = 9;
 pub const HTCLOSE: isize = 20;
 
@@ -152,6 +215,7 @@ pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 pub const VK_F11: i32 = 0x7a;
 pub const VK_F9: i32 = 0x78;
 pub const VK_CONTROL: i32 = 0x11;
+pub const VK_MENU: i32 = 0x12;
 pub const VK_SHIFT: i32 = 0x10;
 pub const VK_L: i32 = 0x4c;
 pub const VK_ESCAPE: i32 = 0x1b;
@@ -260,6 +324,122 @@ unsafe extern "system" {
     ) -> Handle;
     pub fn CallNextHookEx(hook: Handle, code: i32, wparam: usize, lparam: isize) -> isize;
     pub fn InvalidateRect(hwnd: Hwnd, rect: *const Rect, erase: i32) -> i32;
+    pub fn RegisterClassW(class: *const WndClassW) -> u16;
+    pub fn CreateWindowExW(
+        ex_style: u32,
+        class: *const u16,
+        title: *const u16,
+        style: u32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        parent: Hwnd,
+        menu: Handle,
+        instance: Hmodule,
+        param: *mut c_void,
+    ) -> Hwnd;
+    pub fn DestroyWindow(hwnd: Hwnd) -> i32;
+    pub fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
+    pub fn TranslateMessage(msg: *const Msg) -> i32;
+    pub fn DispatchMessageW(msg: *const Msg) -> isize;
+    pub fn IsDialogMessageW(hwnd: Hwnd, msg: *const Msg) -> i32;
+    pub fn PostQuitMessage(code: i32);
+    pub fn EnableWindow(hwnd: Hwnd, enable: i32) -> i32;
+    pub fn GetActiveWindow() -> Hwnd;
+    pub fn SetActiveWindow(hwnd: Hwnd) -> Hwnd;
+    pub fn GetCursorPos(pt: *mut Point) -> i32;
+    pub fn SetTimer(hwnd: Hwnd, id: usize, elapse: u32, func: *const ()) -> usize;
+    pub fn KillTimer(hwnd: Hwnd, id: usize) -> i32;
+    pub fn SetForegroundWindow(hwnd: Hwnd) -> i32;
+    pub fn SetFocus(hwnd: Hwnd) -> Hwnd;
+    pub fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
+    pub fn SetCursor(cursor: Handle) -> Handle;
+    pub fn LoadCursorW(instance: Hmodule, name: *const u16) -> Handle;
+    pub fn DrawTextW(dc: Hdc, text: *const u16, count: i32, rect: *mut Rect, format: u32) -> i32;
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    pub fn GetStockObject(object: i32) -> Handle;
+    pub fn GetDC(hwnd: Hwnd) -> Hdc;
+    pub fn ReleaseDC(hwnd: Hwnd, dc: Hdc) -> i32;
+    pub fn GetDeviceCaps(dc: Hdc, index: i32) -> i32;
+    pub fn CreateCompatibleDC(dc: Hdc) -> Hdc;
+    pub fn DeleteDC(dc: Hdc) -> i32;
+    pub fn SelectObject(dc: Hdc, object: Handle) -> Handle;
+}
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    pub fn ShellExecuteW(
+        hwnd: Hwnd,
+        op: *const u16,
+        file: *const u16,
+        params: *const u16,
+        dir: *const u16,
+        show: i32,
+    ) -> Handle;
+}
+
+// ---- WinHTTP (release check). System TLS, no extra crate. ----
+pub const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
+pub const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+pub const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
+pub const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+
+#[link(name = "winhttp")]
+unsafe extern "system" {
+    pub fn WinHttpOpen(
+        agent: *const u16,
+        access_type: u32,
+        proxy: *const u16,
+        bypass: *const u16,
+        flags: u32,
+    ) -> Handle;
+    pub fn WinHttpConnect(session: Handle, server: *const u16, port: u16, reserved: u32) -> Handle;
+    pub fn WinHttpOpenRequest(
+        connect: Handle,
+        verb: *const u16,
+        path: *const u16,
+        version: *const u16,
+        referrer: *const u16,
+        accept_types: *const *const u16,
+        flags: u32,
+    ) -> Handle;
+    pub fn WinHttpSetTimeouts(
+        session: Handle,
+        resolve: i32,
+        connect: i32,
+        send: i32,
+        receive: i32,
+    ) -> i32;
+    pub fn WinHttpSendRequest(
+        request: Handle,
+        headers: *const u16,
+        headers_len: u32,
+        optional: *mut c_void,
+        optional_len: u32,
+        total_len: u32,
+        context: usize,
+    ) -> i32;
+    pub fn WinHttpReceiveResponse(request: Handle, reserved: *mut c_void) -> i32;
+    pub fn WinHttpQueryHeaders(
+        request: Handle,
+        info_level: u32,
+        name: *const u16,
+        buffer: *mut c_void,
+        buffer_len: *mut u32,
+        index: *mut u32,
+    ) -> i32;
+    pub fn WinHttpQueryDataAvailable(request: Handle, available: *mut u32) -> i32;
+    pub fn WinHttpReadData(
+        request: Handle,
+        buffer: *mut c_void,
+        to_read: u32,
+        read: *mut u32,
+    ) -> i32;
+    pub fn WinHttpCloseHandle(handle: Handle) -> i32;
 }
 
 #[link(name = "winmm")]

@@ -308,6 +308,98 @@ flash. Deliberate taskbar minimises still work.
 fix_alt_tab=1
 ```
 
+### `freeze_pan_while_dragging`
+
+- **Default:** `1`
+- **Aliases:** `drag_pan_fix`, `freeze_pan_on_drag`
+
+The engine polls the cursor every frame and pans the camera when it reaches the
+client edge. Moving or resizing the window puts the real cursor on the window
+frame, which is the client edge, so the battle camera pans for the whole
+gesture. While `WM_ENTERSIZEMOVE` is active this setting reports the last cursor
+position seen inside the client area instead, clamped away from the edges, so
+the camera stays still until the drag ends. `0` restores the old behaviour; the
+engine's own edge-scrolling toggle (ALT+E in CM) is unaffected.
+
+```ini
+freeze_pan_while_dragging=1
+```
+
+### `resize_border`
+
+- **Default:** `10`
+- **Aliases:** `drag_border`, `resize_grip`
+
+Pixels claimed for resizing just **inside** each client edge. The proxy answers
+`WM_NCHITTEST` with the matching `HTLEFT`/`HTTOPLEFT`/… code for those pixels, so
+Windows runs its own resize loop (live resize, minimum size, resize cursor) and
+the effective border is much fatter than the thin native frame. `0` leaves only
+the native frame. Framed windows only: borderless F11 input is untouched.
+
+Combat Mission's battle HUD reaches the window edges, so the outermost 10 px of
+the HUD resize instead of clicking. Lower the value (or use `0`) if that
+interferes with the command panel.
+
+```ini
+resize_border=10
+```
+
+### `resize_modifier`
+
+- **Default:** `ctrl_shift`
+- **Aliases:** `resize_key`
+- **Values:** `ctrl_shift`, `ctrl`, `shift`, `alt`, `none`
+
+While this modifier is held, the whole game view acts as a resize handle: the
+left/right/top/bottom third resizes that edge (corners resize both), and the
+centre uses the nearest edge. The normal resize cursor appears and Windows does
+the resize; it never moves the window. `none` disables the whole-view gesture
+and leaves only `resize_border`.
+
+The default avoids Alt because Alt is a Windows menu key (Alt+Space, Alt+F4,
+Alt+Tab) and its key-up opens the window menu. Ctrl+Shift has no Windows
+binding. The gesture does not run in borderless fullscreen.
+
+```ini
+resize_modifier=ctrl_shift
+```
+
+### `check_updates`
+
+- **Default:** `ask`
+- **Aliases:** `update_check`
+- **Values:** `ask`, `on`, `off`
+
+Controls the release check. `ask` shows a yes/no prompt on the first launch
+(**No** preselected) and remembers the answer in the `[state]` section of
+`coke_config.ini`; declining means no network traffic until the setting changes.
+`on` checks without asking. `off` disables the check entirely.
+
+The prompt is a separate top-level window with its own taskbar button and
+Alt+Tab entry. Clicking the game leaves it open instead of discarding it, so you
+can come back to it. Only the close box or Escape dismisses it; that records
+nothing, so the question returns on the next launch.
+
+With consent, a background thread requests the public GitHub release list once
+per game launch (no daily throttle), using WinHTTP and the system certificate
+store. It sends no personal data, identifiers or telemetry. A newer tag shows a
+three-button window: **Download** opens
+`github.com/aktionkokain/coke/releases` in the default browser, **Ignore this
+version** records the tag, and **Never check again** disables future checks.
+Coke never downloads or replaces its own DLL. Dismissing that notice records
+nothing and leaves the choice for later.
+
+The `[state]` section is written by the proxy and safe to delete; deleting it
+makes the consent prompt appear again. It holds only `update_consent`,
+`update_disabled`, `ignored_update` and `notified_update`.
+`deploy.ps1` preserves the section when it installs a new config, so a
+deployment never resets your answer. An old standalone `coke_state.ini` is
+migrated into the section once and then removed.
+
+```ini
+check_updates=ask
+```
+
 ### `scale_fixes`
 
 - **Default:** `1`

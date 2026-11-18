@@ -6,6 +6,18 @@ use std::sync::OnceLock;
 // ---- code ----
 // --------------------------------------------------------------- configuration
 
+/// Release check modes for `check_updates`.
+pub const UPDATE_CHECK_OFF: u8 = 0;
+pub const UPDATE_CHECK_ASK: u8 = 1;
+pub const UPDATE_CHECK_ON: u8 = 2;
+
+/// Modifier that turns the whole client area into a resize handle.
+pub const RESIZE_MODIFIER_NONE: u8 = 0;
+pub const RESIZE_MODIFIER_CTRL_SHIFT: u8 = 1;
+pub const RESIZE_MODIFIER_CTRL: u8 = 2;
+pub const RESIZE_MODIFIER_SHIFT: u8 = 3;
+pub const RESIZE_MODIFIER_ALT: u8 = 4;
+
 #[derive(Clone)]
 pub struct Config {
     /// Start borderless fullscreen instead of a framed window.
@@ -25,6 +37,20 @@ pub struct Config {
     pub stretch: bool,
     /// Keep the last frame on focus loss instead of minimising.
     pub fix_alt_tab: bool,
+    /// While the window is being moved or resized, feed the engine the last
+    /// in-client cursor position instead of the live one, so its per-frame
+    /// edge-scroll does not pan the camera during the drag.
+    pub freeze_pan_while_dragging: bool,
+    /// Width in pixels of the resize handle claimed just inside each client
+    /// edge (0 = only the native frame resizes).
+    pub resize_border: i32,
+    /// Modifier that turns the whole client area into a resize handle. See
+    /// `RESIZE_MODIFIER_*`. Ctrl+Shift by default because Alt is a Windows
+    /// menu key (Alt+Space, Alt+F4, Alt+Tab).
+    pub resize_modifier: u8,
+    /// Release check: off, ask on first launch, or always on. See
+    /// `UPDATE_CHECK_*`.
+    pub check_updates: u8,
     /// 0 = uncapped.
     pub limit_fps: u32,
     /// Force wglSwapIntervalEXT to this value; `None` leaves the game alone.
@@ -126,6 +152,10 @@ impl Default for Config {
             fullscreen_inset_edge: 0,
             stretch: true,
             fix_alt_tab: true,
+            freeze_pan_while_dragging: true,
+            resize_border: 10,
+            resize_modifier: RESIZE_MODIFIER_CTRL_SHIFT,
+            check_updates: UPDATE_CHECK_ASK,
             limit_fps: 0,
             vsync: None,
             boost_workers: false,
@@ -183,7 +213,19 @@ pub fn load_config() -> Config {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return cfg;
     };
+    let mut in_state = false;
     for raw in text.lines() {
+        let trimmed = raw.trim();
+        // `[state]` is runtime data written by the proxy, not settings. Skip it
+        // so a state key can never be mistaken for a config key.
+        if let Some(name) = trimmed.strip_prefix('[') {
+            let name = name.strip_suffix(']').unwrap_or(name).trim();
+            in_state = name.eq_ignore_ascii_case("state");
+            continue;
+        }
+        if in_state {
+            continue;
+        }
         let line = raw.split(['#', ';']).next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
@@ -275,6 +317,28 @@ pub fn apply_setting(cfg: &mut Config, key: &str, value: &str) {
         "boost_workers" | "boost_threads" => cfg.boost_workers = on,
         // ---- compat / debug
         "fix_alt_tab" => cfg.fix_alt_tab = on,
+        "freeze_pan_while_dragging" | "drag_pan_fix" | "freeze_pan_on_drag" => {
+            cfg.freeze_pan_while_dragging = on;
+        }
+        "resize_border" | "drag_border" | "resize_grip" => {
+            cfg.resize_border = value.parse::<i32>().unwrap_or(10).clamp(0, 64);
+        }
+        "resize_modifier" | "resize_key" => {
+            cfg.resize_modifier = match value.to_ascii_lowercase().as_str() {
+                "none" | "off" | "0" => RESIZE_MODIFIER_NONE,
+                "ctrl" | "control" => RESIZE_MODIFIER_CTRL,
+                "shift" => RESIZE_MODIFIER_SHIFT,
+                "alt" => RESIZE_MODIFIER_ALT,
+                _ => RESIZE_MODIFIER_CTRL_SHIFT,
+            };
+        }
+        "check_updates" | "update_check" => {
+            cfg.check_updates = match value.as_str() {
+                "off" | "none" | "no" | "0" => UPDATE_CHECK_OFF,
+                "on" | "yes" | "true" | "1" => UPDATE_CHECK_ON,
+                _ => UPDATE_CHECK_ASK,
+            };
+        }
         "scale_fixes" | "scale" => cfg.scale_fixes = on,
         "promote_scene" | "promote" | "scene_promote" => cfg.promote_scene = on,
         "hook_slots" => cfg.hook_slots = on,
@@ -427,6 +491,37 @@ mod tests {
         assert_eq!(cfg.relayout_delay_ms, 2000);
         apply_setting(&mut cfg, "los_clip_bottom_pct", "99");
         assert_eq!(cfg.los_clip_bottom_pct, 40);
+    }
+
+    #[test]
+    fn drag_pan_guard_can_be_disabled() {
+        let mut cfg = Config::default();
+        assert!(cfg.freeze_pan_while_dragging, "on by default");
+        apply_setting(&mut cfg, "freeze_pan_while_dragging", "0");
+        assert!(!cfg.freeze_pan_while_dragging);
+        apply_setting(&mut cfg, "drag_pan_fix", "1");
+        assert!(cfg.freeze_pan_while_dragging);
+    }
+
+    #[test]
+    fn update_check_is_ask_by_default() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.check_updates, UPDATE_CHECK_ASK);
+        apply_setting(&mut cfg, "check_updates", "off");
+        assert_eq!(cfg.check_updates, UPDATE_CHECK_OFF);
+        apply_setting(&mut cfg, "update_check", "on");
+        assert_eq!(cfg.check_updates, UPDATE_CHECK_ON);
+        apply_setting(&mut cfg, "check_updates", "ask");
+        assert_eq!(cfg.check_updates, UPDATE_CHECK_ASK);
+        apply_setting(&mut cfg, "resize_border", "16");
+        assert_eq!(cfg.resize_border, 16);
+        apply_setting(&mut cfg, "resize_border", "999");
+        assert_eq!(cfg.resize_border, 64, "clamped");
+        assert_eq!(cfg.resize_modifier, RESIZE_MODIFIER_CTRL_SHIFT, "default");
+        apply_setting(&mut cfg, "resize_modifier", "alt");
+        assert_eq!(cfg.resize_modifier, RESIZE_MODIFIER_ALT);
+        apply_setting(&mut cfg, "resize_modifier", "none");
+        assert_eq!(cfg.resize_modifier, RESIZE_MODIFIER_NONE);
     }
 
     #[test]

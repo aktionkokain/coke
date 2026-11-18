@@ -128,7 +128,9 @@ pub unsafe extern "system" fn hook_get_cursor_pos(pt: *mut Point) -> i32 {
         if ClientToScreen(hwnd, &mut origin) == 0 {
             return ok;
         }
-        let (lx, ly) = client_to_logical((*pt).x - origin.x, (*pt).y - origin.y);
+        let (cx, cy) = ((*pt).x - origin.x, (*pt).y - origin.y);
+        let (gx, gy) = guard_drag_cursor(hwnd, cx, cy);
+        let (lx, ly) = client_to_logical(gx, gy);
         static GCP_LOG: AtomicU32 = AtomicU32::new(0);
         if GCP_LOG.fetch_add(1, Ordering::Relaxed) < 5 {
             let (sx, sy) = scale_xy();
@@ -143,5 +145,54 @@ pub unsafe extern "system" fn hook_get_cursor_pos(pt: *mut Point) -> i32 {
         (*pt).x = lx;
         (*pt).y = ly;
         ok
+    }
+}
+
+/// Replace the live client position with a frozen one while the window is being
+/// moved or resized.
+///
+/// The engine polls `GetCursorPos` every frame and pans the camera when the
+/// cursor reaches the client edge. Dragging the frame (or a resize border) puts
+/// the real cursor on that edge for the whole gesture, so the camera runs away
+/// while the window moves. The last sample taken inside the client area is kept
+/// and reported instead, clamped away from the edges by [`pan_guard_point`].
+unsafe fn guard_drag_cursor(hwnd: Hwnd, cx: i32, cy: i32) -> (i32, i32) {
+    unsafe {
+        if !config().freeze_pan_while_dragging {
+            return (cx, cy);
+        }
+        if WINDOW_DRAGGING.load(Ordering::Relaxed) == 0 {
+            // Remember only positions the engine would see as inside the client.
+            let mut c = Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetClientRect(hwnd, &mut c) != 0
+                && cx >= 0
+                && cy >= 0
+                && cx < c.right
+                && cy < c.bottom
+            {
+                DRAG_ANCHOR.store(pack_point(cx, cy), Ordering::Relaxed);
+                DRAG_ANCHOR_VALID.store(1, Ordering::Relaxed);
+            }
+            return (cx, cy);
+        }
+        if DRAG_ANCHOR_VALID.load(Ordering::Relaxed) == 0 {
+            return (cx, cy);
+        }
+        let (ax, ay) = unpack_point(DRAG_ANCHOR.load(Ordering::Relaxed));
+        let mut c = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetClientRect(hwnd, &mut c) == 0 {
+            return (ax, ay);
+        }
+        pan_guard_point(ax, ay, c.right - c.left, c.bottom - c.top)
     }
 }

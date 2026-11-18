@@ -190,6 +190,7 @@ pub unsafe fn watcher() -> u32 {
                 MAIN_WINDOW.store(0, Ordering::Relaxed);
                 ORIGINAL_WNDPROC.store(0, Ordering::Relaxed);
                 INITIAL_MODE_DONE.store(0, Ordering::Relaxed);
+                WINDOW_DRAGGING.store(0, Ordering::Relaxed);
                 last_client = 0;
                 log("main window destroyed by the engine; waiting for the new one");
                 hwnd = core::ptr::null_mut();
@@ -316,6 +317,12 @@ pub unsafe fn watcher() -> u32 {
             // not each invent a loop on their worker thread.
             if !iconic {
                 hotkeys::poll(GetForegroundWindow() == hwnd);
+            }
+
+            // Opt-in release check. Starts a worker at most once, a few seconds
+            // after the window appears; no-op when `check_updates=off`.
+            if !iconic {
+                updates::tick(hwnd);
             }
 
             // While a heap scan is in progress, poll fast: the F11 key and the

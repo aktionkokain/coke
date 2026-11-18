@@ -23,6 +23,7 @@ mod cbt;
 mod coke;
 mod config;
 mod crash;
+mod dialog;
 mod engine;
 mod ffi;
 mod hooks;
@@ -37,6 +38,7 @@ mod profile;
 mod rtti;
 mod state;
 mod tuning;
+mod updates;
 mod util;
 mod watcher;
 mod widgets;
@@ -47,9 +49,9 @@ mod wtree;
 // through `use crate::*` without a wall of per-file import lists.
 #[allow(unused_imports)]
 pub(crate) use {
-    cbt::*, coke::*, config::*, crash::*, engine::*, ffi::*, hooks::*, hotkeys::*, init::*,
-    install::*, los::*, opengl::*, overlay::*, perf::*, profile::*, rtti::*, state::*, tuning::*,
-    util::*, watcher::*, widgets::*, window::*, wtree::*,
+    cbt::*, coke::*, config::*, crash::*, dialog::*, engine::*, ffi::*, hooks::*, hotkeys::*,
+    init::*, install::*, los::*, opengl::*, overlay::*, perf::*, profile::*, rtti::*, state::*,
+    tuning::*, updates::*, util::*, watcher::*, widgets::*, window::*, wtree::*,
 };
 
 include!(concat!(env!("OUT_DIR"), "/names.rs"));
