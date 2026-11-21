@@ -15,6 +15,7 @@ function Get-CokeMods {
         [pscustomobject]@{ Name = "coke-fps";  Stem = "coke_fps";  Config = $null }
         [pscustomobject]@{ Name = "coke-los";  Stem = "cokelos";   Config = "cokelos.ini" }
         [pscustomobject]@{ Name = "coke-prof"; Stem = "coke_prof"; Config = "coke-prof.ini" }
+        [pscustomobject]@{ Name = "coke-camera"; Stem = "coke_camera"; Config = "coke-camera.ini" }
     )
 }
 
@@ -28,12 +29,6 @@ function Copy-CokeMods {
     $root = Split-Path -Parent $PSScriptRoot
 
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-
-    # Coke Shot is an optional standalone download, never part of the default
-    # drag-and-drop Coke package.
-    foreach ($name in @("coke_camera.dll", "coke-camera.ini", "user_consent_coke_camera.txt")) {
-        Remove-Item -LiteralPath (Join-Path $Destination $name) -Force -ErrorAction SilentlyContinue
-    }
 
     foreach ($mod in Get-CokeMods) {
         $modDir = Join-Path $root "mods\$($mod.Name)"

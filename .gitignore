@@ -8,7 +8,7 @@ target/
 .idea/
 Thumbs.db
 desktop.ini
-
+scratchpad.md
 # Built binaries. dist/ is the only place they are published, see below.
 *.pdb
 *.lib
@@ -40,3 +40,4 @@ docs/meta/ISSUES.md
 # to dist/PROFILES.zip, and that same zip is uploaded to releases. Only drop-in
 # release artifacts belong here; compiler output stays in target/.
 /dist/staging/
+handoff.md

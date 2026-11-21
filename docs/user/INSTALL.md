@@ -116,9 +116,9 @@ coke\coke_fps.dll
 coke\user_consent_coke_fps.txt
 ```
 
-The release ships every default mod in `dist\mods\`, each with its own
-`user_consent_*.txt` and `.ini`. Copy the files from `dist\mods\` into `coke\`
-to install them all at once.
+The release ships every mod in `dist\mods\`, each with its own
+`user_consent_*.txt` and optional `.ini`. Copy the files from `dist\mods\` into
+`coke\` to install them all at once, including Coke Shot.
 
 ## 3. Install a build profile
 

@@ -7,9 +7,7 @@ param(
     [string]$GameDir = "",
     # Executable name, e.g. "CM Cold War.exe". Detected when omitted.
     [string]$Exe = "",
-    [switch]$WithMods,
-    # Coke Shot is a separate optional download; request it explicitly.
-    [switch]$WithCameraMod
+    [switch]$WithMods
 )
 
 $ErrorActionPreference = "Stop"
@@ -105,16 +103,16 @@ if (Test-Path $profileSrc) {
 $coke = Join-Path $GameDir $names.mod_dir
 New-Item -ItemType Directory -Path $coke -Force | Out-Null
 
-if ($WithMods -or $WithCameraMod) {
+if ($WithMods) {
     $mods = @()
     if ($WithMods) {
         $mods += @(
-            @{ Dir = "coke-fps"; Dll = "coke_fps.dll" },
-            @{ Dir = "coke-los"; Dll = "cokelos.dll" },
-            @{ Dir = "coke-prof"; Dll = "coke_prof.dll" }
+            @{ Dir = "coke-fps"; Dll = "coke_fps.dll"; Ini = $null },
+            @{ Dir = "coke-los"; Dll = "cokelos.dll"; Ini = "cokelos.ini" },
+            @{ Dir = "coke-prof"; Dll = "coke_prof.dll"; Ini = "coke-prof.ini" },
+            @{ Dir = "coke-camera"; Dll = "coke_camera.dll"; Ini = "coke-camera.ini" }
         )
     }
-    if ($WithCameraMod) { $mods += @{ Dir = "coke-camera"; Dll = "coke_camera.dll" } }
     foreach ($mod in $mods) {
         $modDll = Join-Path $root "mods\$($mod.Dir)\target\i686-pc-windows-msvc\release\$($mod.Dll)"
         if (Test-Path $modDll) {
@@ -122,21 +120,18 @@ if ($WithMods -or $WithCameraMod) {
             $stem = [System.IO.Path]::GetFileNameWithoutExtension($mod.Dll)
             Write-Host "Copied $($mod.Dll) to coke\"
             Write-Host "  to enable it, create coke\user_consent_$stem.txt (empty is fine)"
+            if ($mod.Ini) {
+                $modIni = Join-Path $root "mods\$($mod.Dir)\$($mod.Ini)"
+                if (Test-Path -LiteralPath $modIni) {
+                    Copy-Item $modIni $coke -Force
+                }
+            }
         }
     }
     $profIni = Join-Path $root "mods\coke-prof\coke-prof.ini"
     if (Test-Path $profIni) {
         Copy-Item $profIni (Join-Path $GameDir "coke-prof.ini") -Force
         Copy-Item $profIni (Join-Path $coke "coke-prof.ini") -Force
-    }
-    if ($WithCameraMod) {
-        $cameraIni = Join-Path $root "mods\coke-camera\coke-camera.ini"
-        if (Test-Path $cameraIni) {
-            Copy-Item $cameraIni (Join-Path $coke "coke-camera.ini") -Force
-        }
-        $cameraConsent = Join-Path $coke "user_consent_coke_camera.txt"
-        Set-Content -LiteralPath $cameraConsent -Value "Coke Shot enabled by explicit installation." -Encoding ascii
-        Write-Host "Installed Coke Shot (enabled by default)"
     }
 }
 

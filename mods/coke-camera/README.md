@@ -1,9 +1,10 @@
 # Coke Shot
 
-Optional RTS camera controller for the `coke/` host. It is enabled by default
-after installation, but is distributed separately from the base Coke package.
-Download `Coke-Shot.zip`, then copy its DLL, INI, and consent file into the
-game's `coke/` folder. The consent file opts into loading the mod.
+RTS camera controller for the `coke/` host. It follows the standard Coke
+submod distribution: copy `dist/mods/` contents into the game's `coke/` folder,
+or install the complete submod set with `scripts/deploy.ps1 -WithMods`.
+Its shipped consent file opts into loading the mod, and `enabled=1` is the
+default in `coke-camera.ini`.
 
 It uses the host's validated camera API rather than CMBS addresses. In RTS mode,
 WASD emits constant-speed ground-relative pan commands, RMB emits cursor-delta
