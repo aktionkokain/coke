@@ -467,6 +467,8 @@ unsafe extern "system" {
     pub fn CopyFileW(from: *const u16, to: *const u16, fail_if_exists: i32) -> i32;
     pub fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, len: u32) -> u32;
     pub fn CreateDirectoryW(path: *const u16, sa: *mut c_void) -> i32;
+    pub fn DisableThreadLibraryCalls(module: Hmodule) -> i32;
+    pub fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     pub fn VirtualProtect(addr: *mut c_void, size: usize, new: u32, old: *mut u32) -> i32;
     pub fn VirtualQuery(addr: *const c_void, info: *mut MemBasicInfo, len: usize) -> usize;
     /// Fault-safe memory read: returns 0 instead of raising an exception when
@@ -513,6 +515,9 @@ unsafe extern "system" {
         handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
     ) -> *mut c_void;
 }
+
+pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+pub const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
 
 #[repr(C)]
 pub struct ExceptionRecord {

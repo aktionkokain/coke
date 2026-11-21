@@ -60,6 +60,12 @@ fn extract(zip_path: &Path, dest: &Path) -> Result<usize, String> {
             continue;
         };
         let out_path = dest.join(&rel);
+        // The ZIP is intentionally left beside the game so it can be reused
+        // after a clean install. Never overwrite a profile that the user may
+        // have edited locally while that ZIP remains present.
+        if out_path.exists() {
+            continue;
+        }
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create {}: {e}", parent.display()))?;

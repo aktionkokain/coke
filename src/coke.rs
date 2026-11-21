@@ -22,6 +22,65 @@ use std::ffi::{CStr, c_char};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
+const MAX_MOD_BUFFER: usize = 4 * 1024 * 1024;
+
+/// Validate a native mod's output buffer before turning it into a Rust slice.
+/// The ABI is intentionally unsafe, but a bad plugin must not make slice
+/// construction itself invoke undefined behavior.
+unsafe fn valid_mod_buffer(
+    ptr: *const c_void,
+    len: usize,
+    writable: bool,
+    alignment: usize,
+) -> bool {
+    unsafe {
+        if ptr.is_null() || len == 0 || len > MAX_MOD_BUFFER {
+            return false;
+        }
+        let start = ptr as usize;
+        if !start.is_multiple_of(alignment) {
+            return false;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let mut cursor = start;
+        while cursor < end {
+            let mut info: MemBasicInfo = core::mem::zeroed();
+            if VirtualQuery(
+                cursor as *const c_void,
+                &mut info,
+                core::mem::size_of::<MemBasicInfo>(),
+            ) == 0
+                || info.state != MEM_COMMIT
+                || info.protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            {
+                return false;
+            }
+            if writable
+                && !matches!(
+                    info.protect & 0xff,
+                    PAGE_READWRITE
+                        | PAGE_WRITECOPY
+                        | PAGE_EXECUTE_READWRITE
+                        | PAGE_EXECUTE_WRITECOPY
+                )
+            {
+                return false;
+            }
+            let Some(region_end) = (info.base_address as usize).checked_add(info.region_size)
+            else {
+                return false;
+            };
+            if region_end <= cursor {
+                return false;
+            }
+            cursor = region_end.min(end);
+        }
+        true
+    }
+}
+
 // The ABI types live in `crates/coke-host` so the proxy and every mod share
 // one definition. Re-exported here because the rest of the crate reaches them
 // through `crate::*`.
@@ -74,7 +133,9 @@ unsafe extern "system" fn host_read_f32(addr: u32) -> f32 {
 
 unsafe extern "system" fn host_read_bytes(addr: u32, out: *mut u8, len: u32) -> i32 {
     unsafe {
-        if out.is_null() || len == 0 || len > 16 * 1024 * 1024 {
+        if !valid_mod_buffer(out.cast(), len as usize, true, core::mem::align_of::<u8>())
+            || len > 16 * 1024 * 1024
+        {
             return 0;
         }
         let buf = core::slice::from_raw_parts_mut(out, len as usize);
@@ -236,6 +297,19 @@ unsafe extern "system" fn host_los_scan(
         if vis.is_null() || heights.is_null() || nx.is_null() || nz.is_null() {
             return 0;
         }
+        if !valid_mod_buffer(
+            vis.cast(),
+            vis_len as usize,
+            true,
+            core::mem::align_of::<u8>(),
+        ) || !valid_mod_buffer(
+            heights.cast(),
+            heights_len as usize,
+            true,
+            core::mem::align_of::<f32>(),
+        ) {
+            return 0;
+        }
         let v = core::slice::from_raw_parts_mut(vis, vis_len as usize);
         let h = core::slice::from_raw_parts_mut(heights, heights_len as usize);
         match los_scan(ox, oz, eye, range, cell, target_h, v, h) {
@@ -362,6 +436,19 @@ unsafe extern "system" fn host_los_scan_map(
 ) -> i32 {
     unsafe {
         if vis.is_null() || heights.is_null() || nx.is_null() || nz.is_null() {
+            return 0;
+        }
+        if !valid_mod_buffer(
+            vis.cast(),
+            vis_len as usize,
+            true,
+            core::mem::align_of::<u8>(),
+        ) || !valid_mod_buffer(
+            heights.cast(),
+            heights_len as usize,
+            true,
+            core::mem::align_of::<f32>(),
+        ) {
             return 0;
         }
         let v = core::slice::from_raw_parts_mut(vis, vis_len as usize);

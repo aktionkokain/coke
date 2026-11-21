@@ -65,7 +65,20 @@ include!(concat!(env!("OUT_DIR"), "/thunks.rs"));
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(instance: Hmodule, reason: u32, _reserved: usize) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
-        unsafe { init(instance) };
+        unsafe {
+            DisableThreadLibraryCalls(instance);
+            let mut tid = 0u32;
+            // Do not perform filesystem work or load another DLL under the
+            // loader lock. The bootstrap thread starts once DllMain returns.
+            CreateThread(
+                core::ptr::null_mut(),
+                256 * 1024,
+                init_thread,
+                instance,
+                0,
+                &mut tid,
+            );
+        }
     }
     1
 }

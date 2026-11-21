@@ -671,14 +671,20 @@ pub unsafe extern "system" fn custom_wndproc(
 
         match msg {
             WM_CLOSE => {
-                log("WM_CLOSE: force-quitting");
-                ExitProcess(0);
+                if config().forced_exit {
+                    log("WM_CLOSE: force-quitting");
+                    ExitProcess(0);
+                }
+                return call_original(hwnd, msg, wparam, lparam);
             }
             WM_SYSCOMMAND => {
                 match wparam & 0xFFF0 {
                     SC_CLOSE => {
-                        log("SC_CLOSE: force-quitting");
-                        ExitProcess(0);
+                        if config().forced_exit {
+                            log("SC_CLOSE: force-quitting");
+                            ExitProcess(0);
+                        }
+                        return call_original(hwnd, msg, wparam, lparam);
                     }
                     SC_MAXIMIZE => {
                         WINDOW_MODE.store(2, Ordering::Relaxed);

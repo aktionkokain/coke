@@ -4,6 +4,14 @@ use crate::*;
 use core::sync::atomic::Ordering;
 use std::path::PathBuf;
 
+/// Runs after the loader has released the loader lock. `DllMain` must only
+/// schedule this worker; loading the real OpenGL DLL and reading profiles from
+/// inside `DllMain` can deadlock Windows startup.
+pub extern "system" fn init_thread(param: *mut core::ffi::c_void) -> u32 {
+    unsafe { init(param as Hmodule) };
+    0
+}
+
 // ---- code ----
 // ------------------------------------------------------------- real opengl32
 /// This module is loaded as `opengl32.dll`, so `LoadLibraryExW` on the System32

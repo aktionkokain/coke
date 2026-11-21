@@ -12,6 +12,7 @@
 
 use crate::*;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::io::Write;
 
 const API_HOST: &str = "api.github.com";
 const API_PATH: &str = "/repos/aktionkokain/coke/releases/latest";
@@ -131,7 +132,27 @@ impl State {
         if let Some(v) = &self.notified {
             out.push_str(&format!("notified_update={v}{eol}"));
         }
-        if let Err(e) = std::fs::write(&path, out) {
+        let tmp = path.with_file_name(format!("{}.tmp-{}", CONFIG_FILE, std::process::id()));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(out.as_bytes())?;
+            file.sync_all()?;
+            let from = unsafe { wide(&tmp.to_string_lossy()) };
+            let to = unsafe { wide(&path.to_string_lossy()) };
+            if unsafe {
+                MoveFileExW(
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp);
             log(&format!("updates: cannot write {}: {e}", path.display()));
         }
     }

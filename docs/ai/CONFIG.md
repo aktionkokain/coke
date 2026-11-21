@@ -625,6 +625,17 @@ logical resolution.
 hook_wndproc=1
 ```
 
+### `forced_exit`
+
+Controls how the subclassed window procedure handles the close box and system
+close command. `forced_exit=1` preserves Coke's legacy immediate termination;
+`forced_exit=0` forwards the close message to the game's normal shutdown path,
+which allows orderly cleanup and persistence.
+
+```ini
+forced_exit=0
+```
+
 ### `hook_mode`
 
 - **Default:** `1`

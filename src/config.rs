@@ -109,6 +109,9 @@ pub struct Config {
     pub hook_window: bool,
     /// Subclass the game's window procedure (maximise/close/mouse mapping).
     pub hook_wndproc: bool,
+    /// Force immediate process termination on the window close command.
+    /// When false, the game's normal close path is allowed to run.
+    pub forced_exit: bool,
     /// Apply the start window size and F11 mode changes.
     pub hook_mode: bool,
     /// Log the GL renderer, viewports, fps and window geometry.
@@ -176,6 +179,7 @@ impl Default for Config {
             hook_cbt: true,
             hook_window: true,
             hook_wndproc: true,
+            forced_exit: true,
             hook_mode: true,
             verbose: true,
             show_fps: true,
@@ -368,6 +372,7 @@ pub fn apply_setting(cfg: &mut Config, key: &str, value: &str) {
         "hook_cbt" | "cbt_hook" => cfg.hook_cbt = on,
         "hook_window" => cfg.hook_window = on,
         "hook_wndproc" => cfg.hook_wndproc = on,
+        "forced_exit" | "force_exit" => cfg.forced_exit = on,
         "hook_mode" => cfg.hook_mode = on,
         "verbose" => cfg.verbose = on,
         "show_fps" | "fps_overlay" | "fps_counter" => cfg.show_fps = on,

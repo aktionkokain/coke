@@ -46,7 +46,7 @@ impl Status {
 }
 
 /// The engine's in-memory user32 import slots, as RVAs. `0` = not provided.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct Slots {
     pub close_window: u32,
     pub get_system_metrics: u32,
@@ -61,7 +61,7 @@ impl Slots {
 }
 
 /// The app object that caches the engine canvas.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Canvas {
     pub app_ptr: u32,
     /// Object offset (not an RVA): where the engine stores its HWND.
@@ -70,7 +70,7 @@ pub struct Canvas {
 }
 
 /// The battle-scene objects. Offsets are object offsets, not RVAs.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Scene {
     /// Static global that holds the scene owner. Zero when the build has no
     /// stable owner global (Cold War); use `widget_class` instead.
@@ -112,7 +112,7 @@ impl Scene {
 }
 
 /// The `cokelos` read-only anchors. Absence disables the overlay.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
 pub struct Los {
     pub world_ptr: u32,
     pub scenario_ptr: u32,
@@ -578,6 +578,43 @@ pub fn validate_addresses(p: &Profile) -> Result<(), String> {
             check("los.map_globals", *g)?;
         }
     }
+    if let Some(c) = &p.camera {
+        check("camera.call_site", c.call_site)?;
+        check("camera.update_fn", c.update_fn)?;
+        if !c.call_expected.is_empty() && c.call_expected.len() != 5 {
+            return Err("camera.call_expected must contain exactly 5 bytes".to_string());
+        }
+        if !c.call_expected.is_empty() && c.call_expected[0] != 0xe8 {
+            return Err("camera.call_expected must start with the CALL opcode".to_string());
+        }
+        for (what, site, expected) in [
+            (
+                "camera.pan_ramp_site",
+                c.pan_ramp_site,
+                &c.pan_ramp_expected,
+            ),
+            (
+                "camera.drag_yaw_site",
+                c.drag_yaw_site,
+                &c.drag_yaw_expected,
+            ),
+        ] {
+            if site != 0 {
+                if expected.is_empty() {
+                    return Err(format!("{what} needs expected bytes"));
+                }
+                if site.saturating_add(expected.len() as u32) > size {
+                    return Err(format!("{what} patch span exceeds the image"));
+                }
+                check(what, site)?;
+            } else if !expected.is_empty() {
+                return Err(format!("{what} has expected bytes but no site"));
+            }
+        }
+        if c.call_site.saturating_add(5) > size {
+            return Err("camera.call_site patch span exceeds the image".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -759,25 +796,11 @@ fn same_facts(a: &Profile, b: &Profile) -> bool {
         && a.slots.get_system_metrics == b.slots.get_system_metrics
         && a.slots.change_display == b.slots.change_display
         && a.slots.get_cursor_pos == b.slots.get_cursor_pos
-        && a.canvas.map(|c| (c.app_ptr, c.app_hwnd_off))
-            == b.canvas.map(|c| (c.app_ptr, c.app_hwnd_off))
-        && a.scene.as_ref().map(|s| {
-            (
-                s.owner_ptr,
-                s.blur_quad_ptr,
-                s.top_inset,
-                s.widget_class.as_deref(),
-            )
-        }) == b.scene.as_ref().map(|s| {
-            (
-                s.owner_ptr,
-                s.blur_quad_ptr,
-                s.top_inset,
-                s.widget_class.as_deref(),
-            )
-        })
+        && a.canvas == b.canvas
+        && a.scene == b.scene
         && a.rtti == b.rtti
-        && a.los.is_some() == b.los.is_some()
+        && a.los == b.los
+        && a.camera == b.camera
 }
 
 /// Outcome of profile selection.
