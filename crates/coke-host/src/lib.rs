@@ -120,6 +120,10 @@ pub const RANGE_ENABLE_KEYS: u32 = 1;
 pub const RANGE_FROM_CURSOR: u32 = 2;
 pub const RANGE_SET_ORIGIN: u32 = 3;
 pub const RANGE_CANCEL: u32 = 4;
+/// Set the shared range source height from `point.z`; `point.x` and `point.y`
+/// are ignored. Accepted heights are 0.25 through 6.0 metres. Existing v7
+/// table layout is unchanged.
+pub const RANGE_SET_SOURCE_HEIGHT: u32 = 5;
 
 /// Range preview status values returned in `CokeRangeResult::status`.
 pub const RANGE_WAITING: u32 = 1;

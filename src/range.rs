@@ -10,8 +10,10 @@ use std::sync::{Mutex, OnceLock};
 
 const SCENE_TIMEOUT_MS: u32 = 650;
 const QUERY_INTERVAL_MS: u32 = 100;
+const CURSOR_SAMPLE_INTERVAL_MS: u32 = 16;
 const OBSERVER_POSTURE: i32 = 2;
-const OBSERVER_HEIGHT: f32 = 1.6;
+const NATIVE_OBSERVER_HEIGHT: f32 = 1.6;
+const SOURCE_HEIGHTS: [f32; 4] = [0.25, 1.0, 2.0, 3.5];
 const TARGET_POSTURE: i32 = 4;
 
 #[derive(Clone, Copy)]
@@ -28,14 +30,61 @@ struct Native {
 }
 
 static NATIVE: OnceLock<Native> = OnceLock::new();
+static DEPTH_API: OnceLock<Option<DepthApi>> = OnceLock::new();
+static DEPTH_READBACK: OnceLock<Mutex<DepthReadback>> = OnceLock::new();
 static REQUESTED: AtomicBool = AtomicBool::new(false);
 static KEYS: AtomicBool = AtomicBool::new(false);
 static INSTALL_FAILED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+struct DepthApi {
+    gen_buffers: usize,
+    bind_buffer: usize,
+    buffer_data: usize,
+    map_buffer: usize,
+    unmap_buffer: usize,
+    fence_sync: usize,
+    client_wait_sync: usize,
+    delete_sync: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DepthSample {
+    eye: CokeRangePoint,
+    ray: CokeRangePoint,
+    projection: [f32; 16],
+}
+
+struct DepthReadback {
+    context: usize,
+    buffers: [u32; 2],
+    fences: [usize; 2],
+    samples: [Option<DepthSample>; 2],
+    next: usize,
+    last_hit: Option<CokeRangePoint>,
+    disabled: bool,
+}
+
+impl DepthReadback {
+    const fn new() -> Self {
+        Self {
+            context: 0,
+            buffers: [0; 2],
+            fences: [0; 2],
+            samples: [None; 2],
+            next: 0,
+            last_hit: None,
+            disabled: false,
+        }
+    }
+}
 static STATE: Mutex<State> = Mutex::new(State {
     scene: None,
     seen_at: 0,
     can_start: false,
     unit_selected: false,
+    source_height: SOURCE_HEIGHTS[0],
+    cursor_sample: None,
     pending: None,
     origin: None,
     result: None,
@@ -60,6 +109,8 @@ struct State {
     seen_at: u32,
     can_start: bool,
     unit_selected: bool,
+    source_height: f32,
+    cursor_sample: Option<(u32, CokeRangePoint)>,
     pending: Option<Origin>,
     origin: Option<CokeRangePoint>,
     result: Option<CokeRangeResult>,
@@ -80,6 +131,7 @@ impl State {
         self.origin = None;
         self.result = None;
         self.last_trace = None;
+        self.cursor_sample = None;
     }
 
     fn start(&mut self, origin: Origin) {
@@ -90,6 +142,27 @@ impl State {
 
 fn finite(p: CokeRangePoint) -> bool {
     p.x.is_finite() && p.y.is_finite() && p.z.is_finite()
+}
+
+fn next_source_height(current: f32) -> f32 {
+    SOURCE_HEIGHTS
+        .iter()
+        .copied()
+        .find(|height| *height > current + 0.01)
+        .unwrap_or(SOURCE_HEIGHTS[0])
+}
+
+fn cursor_sample_interval() -> u32 {
+    if DEPTH_API.get().is_some_and(Option::is_none) {
+        return QUERY_INTERVAL_MS;
+    }
+    if let Some(readback) = DEPTH_READBACK.get()
+        && let Ok(state) = readback.try_lock()
+        && state.disabled
+    {
+        return QUERY_INTERVAL_MS;
+    }
+    CURSOR_SAMPLE_INTERVAL_MS
 }
 
 fn in_terrain(p: CokeRangePoint, t: &Terrain) -> bool {
@@ -112,6 +185,18 @@ pub unsafe extern "system" fn control(action: u32, point: *const CokeRangePoint)
     let Ok(mut state) = STATE.try_lock() else {
         return 0;
     };
+    if action == coke_host::RANGE_SET_SOURCE_HEIGHT {
+        if point.is_null() || !point.is_aligned() {
+            return 0;
+        }
+        let height = unsafe { point.read() }.z;
+        if !height.is_finite() || !(SOURCE_HEIGHTS[0]..=6.0).contains(&height) {
+            return 0;
+        }
+        state.source_height = height;
+        state.last_trace = None;
+        return 1;
+    }
     if action == RANGE_CANCEL {
         state.cancel();
         return 1;
@@ -171,7 +256,23 @@ pub fn handle_message(msg: u32, value: usize, flags: isize) -> bool {
         state.cancel();
         return msg == WM_CHAR;
     }
-    if msg != WM_CHAR || !matches!(value, 0x54 | 0x74) {
+    if msg != WM_CHAR {
+        return false;
+    }
+    if matches!(value, 0x48 | 0x68) {
+        if !state.active() {
+            return false;
+        }
+        if unsafe { GetKeyState(0x11) < 0 || GetKeyState(0x12) < 0 } {
+            return false;
+        }
+        if flags & (1 << 30) == 0 {
+            state.source_height = next_source_height(state.source_height);
+            state.last_trace = None;
+        }
+        return true;
+    }
+    if !matches!(value, 0x54 | 0x74) {
         return false;
     }
     if unsafe { GetKeyState(0x11) < 0 || GetKeyState(0x12) < 0 } {
@@ -433,7 +534,11 @@ unsafe fn print_label(native: Native, font: u32, x: i32, y: i32, font_height: u3
     }
 }
 
-unsafe fn cursor(terrain: &Terrain) -> Option<(CokeRangePoint, Point)> {
+unsafe fn cursor(
+    terrain: &Terrain,
+    state: &mut State,
+    now: u32,
+) -> Option<(CokeRangePoint, Point, Option<CokeRangePoint>)> {
     let hwnd = MAIN_WINDOW.load(Ordering::Relaxed) as Hwnd;
     let get = REAL_GET_CURSOR_POS.load(Ordering::Relaxed);
     if hwnd.is_null() || get == 0 {
@@ -449,12 +554,26 @@ unsafe fn cursor(terrain: &Terrain) -> Option<(CokeRangePoint, Point)> {
         x: point.x - client.x,
         y: point.y - client.y,
     };
-    let (eye, ray) = unsafe { battle_cursor_ray(pos.x, pos.y)? };
-    let hit = unsafe { trace_ground(terrain, eye, ray)? };
-    Some((hit, pos))
+    let (eye, ray, projection) = unsafe { battle_cursor_ray(pos.x, pos.y)? };
+    let hit = if let Some((at, hit)) = state.cursor_sample
+        && now.wrapping_sub(at) < cursor_sample_interval()
+    {
+        hit
+    } else {
+        let hit = unsafe { depth_surface(terrain, pos.x, pos.y, eye, ray, &projection) }
+            .or_else(|| unsafe { trace_ground(terrain, eye, ray) })?;
+        state.cursor_sample = Some((now, hit));
+        hit
+    };
+    let ground_origin = if matches!(state.pending, Some(Origin::Cursor)) {
+        unsafe { trace_ground(terrain, eye, ray) }.filter(|point| in_terrain(*point, terrain))
+    } else {
+        None
+    };
+    Some((hit, pos, ground_origin))
 }
 
-unsafe fn battle_cursor_ray(x: i32, y: i32) -> Option<(CokeRangePoint, CokeRangePoint)> {
+unsafe fn battle_cursor_ray(x: i32, y: i32) -> Option<(CokeRangePoint, CokeRangePoint, [f32; 16])> {
     let get = REAL_GL_GET_FLOATV.load(Ordering::Relaxed);
     let get_int = REAL_GL_GET_INTEGERV.load(Ordering::Relaxed);
     if get == 0 || get_int == 0 {
@@ -484,7 +603,225 @@ unsafe fn battle_cursor_ray(x: i32, y: i32) -> Option<(CokeRangePoint, CokeRange
     }
     let ndc_x = (x - left) as f32 * 2.0 / width as f32 - 1.0;
     let ndc_y = (pixel_y - bottom) as f32 * 2.0 / height as f32 - 1.0;
-    unproject_ray(&view, &projection, ndc_x, ndc_y)
+    let (eye, ray) = unproject_ray(&view, &projection, ndc_x, ndc_y)?;
+    Some((eye, ray, projection))
+}
+
+/// Pick the nearest rendered surface asynchronously. A PBO plus a zero-timeout
+/// fence check avoids stalling the battle render thread on GPU readback.
+unsafe fn depth_surface(
+    terrain: &Terrain,
+    x: i32,
+    y: i32,
+    eye: CokeRangePoint,
+    ray: CokeRangePoint,
+    projection: &[f32; 16],
+) -> Option<CokeRangePoint> {
+    let api = DEPTH_API
+        .get_or_init(|| unsafe { load_depth_api() })
+        .as_ref()
+        .copied()?;
+    let context_fn = REAL_WGL_GET_CURRENT_CONTEXT.load(Ordering::Relaxed);
+    let context = if context_fn == 0 {
+        0
+    } else {
+        let f: unsafe extern "system" fn() -> Hglrc = unsafe { core::mem::transmute(context_fn) };
+        unsafe { f() as usize }
+    };
+    if context == 0 {
+        return None;
+    }
+    let get_int = REAL_GL_GET_INTEGERV.load(Ordering::Relaxed);
+    let read_pixels = REAL_GL_READ_PIXELS.load(Ordering::Relaxed);
+    if read_pixels == 0 || get_int == 0 {
+        return None;
+    }
+    let get_int: unsafe extern "system" fn(u32, *mut i32) =
+        unsafe { core::mem::transmute(get_int) };
+    let read_pixels: unsafe extern "system" fn(i32, i32, i32, i32, u32, u32, *mut c_void) =
+        unsafe { core::mem::transmute(read_pixels) };
+    let pixel_y = PHYS_H.load(Ordering::Relaxed) - y - 1;
+    let sample = DepthSample {
+        eye,
+        ray,
+        projection: *projection,
+    };
+    let lock = DEPTH_READBACK.get_or_init(|| Mutex::new(DepthReadback::new()));
+    let Ok(mut readback) = lock.try_lock() else {
+        return None;
+    };
+    if readback.disabled {
+        return None;
+    }
+    if readback.context != context {
+        let bind: unsafe extern "system" fn(u32, u32) =
+            unsafe { core::mem::transmute(api.bind_buffer) };
+        let generate: unsafe extern "system" fn(i32, *mut u32) =
+            unsafe { core::mem::transmute(api.gen_buffers) };
+        let buffer_data: unsafe extern "system" fn(u32, isize, *const c_void, u32) =
+            unsafe { core::mem::transmute(api.buffer_data) };
+        let mut previous = 0i32;
+        unsafe { get_int(0x88ed, &mut previous) }; // GL_PIXEL_PACK_BUFFER_BINDING
+        let mut buffers = [0u32; 2];
+        unsafe { generate(2, buffers.as_mut_ptr()) };
+        if buffers.contains(&0) {
+            readback.disabled = true;
+            return None;
+        }
+        for &buffer in &buffers {
+            unsafe {
+                bind(0x88eb, buffer); // GL_PIXEL_PACK_BUFFER
+                buffer_data(0x88eb, 4, core::ptr::null(), 0x88e1); // GL_STREAM_READ
+            }
+        }
+        unsafe { bind(0x88eb, previous as u32) };
+        readback.context = context;
+        readback.buffers = buffers;
+        readback.fences = [0; 2];
+        readback.samples = [None; 2];
+        readback.next = 0;
+        readback.last_hit = None;
+    }
+
+    let bind: unsafe extern "system" fn(u32, u32) =
+        unsafe { core::mem::transmute(api.bind_buffer) };
+    let map: unsafe extern "system" fn(u32, u32) -> *mut c_void =
+        unsafe { core::mem::transmute(api.map_buffer) };
+    let unmap: unsafe extern "system" fn(u32) -> u8 =
+        unsafe { core::mem::transmute(api.unmap_buffer) };
+    let client_wait: unsafe extern "system" fn(*const c_void, u32, u64) -> u32 =
+        unsafe { core::mem::transmute(api.client_wait_sync) };
+    let delete_sync: unsafe extern "system" fn(*const c_void) =
+        unsafe { core::mem::transmute(api.delete_sync) };
+    for slot in 0..readback.buffers.len() {
+        let fence = readback.fences[slot];
+        if fence == 0 {
+            continue;
+        }
+        let status = unsafe { client_wait(fence as *const c_void, 0, 0) };
+        if status == 0x911b {
+            continue; // GL_TIMEOUT_EXPIRED: never wait on the render thread.
+        }
+        unsafe { delete_sync(fence as *const c_void) };
+        readback.fences[slot] = 0;
+        let sample = readback.samples[slot].take();
+        if status != 0x911a && status != 0x911c {
+            continue; // GL_WAIT_FAILED or an unknown status.
+        }
+        let mut previous = 0i32;
+        unsafe { get_int(0x88ed, &mut previous) };
+        unsafe { bind(0x88eb, readback.buffers[slot]) };
+        let mapped = unsafe { map(0x88eb, 0x88b8) }; // GL_READ_ONLY
+        let depth = if mapped.is_null() {
+            None
+        } else {
+            let value = unsafe { mapped.cast::<f32>().read_unaligned() };
+            (unsafe { unmap(0x88eb) } != 0).then_some(value)
+        };
+        unsafe { bind(0x88eb, previous as u32) };
+        if let Some(sample) = sample {
+            readback.last_hit = depth.and_then(|depth| depth_point(terrain, sample, depth));
+        }
+    }
+
+    let slot = readback.next;
+    if readback.fences[slot] == 0 {
+        let fence_sync: unsafe extern "system" fn(u32, u32) -> *const c_void =
+            unsafe { core::mem::transmute(api.fence_sync) };
+        let mut previous = 0i32;
+        unsafe { get_int(0x88ed, &mut previous) };
+        unsafe { bind(0x88eb, readback.buffers[slot]) };
+        unsafe {
+            read_pixels(
+                x,
+                pixel_y,
+                1,
+                1,
+                0x1902,                // GL_DEPTH_COMPONENT
+                0x1406,                // GL_FLOAT
+                core::ptr::null_mut(), // byte offset zero in the bound PBO
+            )
+        };
+        let fence = unsafe { fence_sync(0x9117, 0) }; // GL_SYNC_GPU_COMMANDS_COMPLETE
+        unsafe { bind(0x88eb, previous as u32) };
+        if fence.is_null() {
+            readback.disabled = true;
+            return None;
+        }
+        readback.fences[slot] = fence as usize;
+        readback.samples[slot] = Some(sample);
+        readback.next = (slot + 1) % readback.buffers.len();
+    }
+    readback.last_hit
+}
+
+unsafe fn load_depth_api() -> Option<DepthApi> {
+    let get_proc = REAL_WGL_GET_PROC_ADDRESS.load(Ordering::Relaxed);
+    if get_proc == 0 {
+        return None;
+    }
+    let get_proc: unsafe extern "system" fn(*const i8) -> *mut c_void =
+        unsafe { core::mem::transmute(get_proc) };
+    let resolve = |core: &'static [u8], arb: &'static [u8]| {
+        let pointer = unsafe { get_proc(core.as_ptr().cast()) } as usize;
+        if pointer > 3 {
+            pointer
+        } else {
+            let pointer = unsafe { get_proc(arb.as_ptr().cast()) } as usize;
+            (pointer > 3).then_some(pointer).unwrap_or(0)
+        }
+    };
+    let api = DepthApi {
+        gen_buffers: resolve(b"glGenBuffers\0", b"glGenBuffersARB\0"),
+        bind_buffer: resolve(b"glBindBuffer\0", b"glBindBufferARB\0"),
+        buffer_data: resolve(b"glBufferData\0", b"glBufferDataARB\0"),
+        map_buffer: resolve(b"glMapBuffer\0", b"glMapBufferARB\0"),
+        unmap_buffer: resolve(b"glUnmapBuffer\0", b"glUnmapBufferARB\0"),
+        fence_sync: resolve(b"glFenceSync\0", b"glFenceSync\0"),
+        client_wait_sync: resolve(b"glClientWaitSync\0", b"glClientWaitSync\0"),
+        delete_sync: resolve(b"glDeleteSync\0", b"glDeleteSync\0"),
+    };
+    (api.gen_buffers != 0
+        && api.bind_buffer != 0
+        && api.buffer_data != 0
+        && api.map_buffer != 0
+        && api.unmap_buffer != 0
+        && api.fence_sync != 0
+        && api.client_wait_sync != 0
+        && api.delete_sync != 0)
+        .then_some(api)
+}
+
+fn depth_point(terrain: &Terrain, sample: DepthSample, depth: f32) -> Option<CokeRangePoint> {
+    if !depth.is_finite() || !(0.0..1.0).contains(&depth) {
+        return None;
+    }
+    let ndc_z = depth * 2.0 - 1.0;
+    let denominator = ndc_z + sample.projection[10];
+    if denominator.abs() < 1e-6 {
+        return None;
+    }
+    // The camera-space ray has z=-1, so this is its distance parameter.
+    let distance = sample.projection[14] / denominator;
+    if !distance.is_finite() || distance <= 0.0 || distance > 5000.0 {
+        return None;
+    }
+    let mut hit = CokeRangePoint {
+        x: sample.eye.x + sample.ray.x * distance,
+        y: sample.eye.y + sample.ray.y * distance,
+        z: sample.eye.z + sample.ray.z * distance,
+    };
+    if !in_terrain(hit, terrain) {
+        return None;
+    }
+    let ground = unsafe { terrain_height(terrain, hit.x, hit.y) };
+    if !ground.is_finite() || hit.z < ground - 0.5 {
+        return None;
+    }
+    if hit.z < ground {
+        hit.z = ground;
+    }
+    Some(hit)
 }
 
 // The battle pass uses a rigid model-view and an OpenGL perspective frustum.
@@ -590,28 +927,36 @@ unsafe fn update(native: Native) {
         return;
     }
     state.result = None;
-    let Some((target, pixel)) =
-        (unsafe { cursor(&terrain) }).filter(|(p, _)| in_terrain(*p, &terrain))
+    let Some((target, pixel, ground_origin)) =
+        (unsafe { cursor(&terrain, &mut state, now) }).filter(|(p, _, _)| in_terrain(*p, &terrain))
     else {
         return;
     };
     if let Some(origin) = state.pending.take() {
         state.origin = match origin {
-            Origin::Cursor => Some(target),
+            Origin::Cursor => ground_origin.or(Some(target)),
             Origin::Point(point) => Some(point).filter(|&p| in_terrain(p, &terrain)),
         };
     }
     let Some(origin) = state.origin else { return };
-    let Some(mut result) =
-        (unsafe { sample(native, scene.owner, origin, target, now, &mut state) })
-    else {
+    let Some(mut result) = (unsafe {
+        sample(
+            native,
+            scene.owner,
+            origin,
+            target,
+            state.source_height,
+            now,
+            &mut state,
+        )
+    }) else {
         return;
     };
     result.cursor_x = pixel.x;
     result.cursor_y = pixel.y;
     state.result = Some(result);
     if result.distance_m >= 0.25 {
-        unsafe { draw(native, scene.owner, result, now) };
+        unsafe { draw(native, scene.owner, result, now, state.source_height) };
     }
 }
 
@@ -635,32 +980,50 @@ unsafe fn sample(
     owner: usize,
     origin: CokeRangePoint,
     target: CokeRangePoint,
+    source_height: f32,
     now: u32,
     state: &mut State,
 ) -> Option<CokeRangeResult> {
     if let Some((at, result)) = state.last_trace
         && now.wrapping_sub(at) < QUERY_INTERVAL_MS
-        && (result.target.x - target.x).abs() < 0.15
-        && (result.target.y - target.y).abs() < 0.15
-        && (result.target.z - target.z).abs() < 0.15
     {
-        return Some(result);
+        return Some(CokeRangeResult {
+            status: result.status,
+            origin,
+            target,
+            distance_m: (target.x - origin.x).hypot(target.y - origin.y),
+            visible_fraction: result.visible_fraction,
+            ..CokeRangeResult::default()
+        });
     }
     let context = unsafe { rd_u32(owner + 0x1c)? } as usize;
     if !unsafe { committed(context, 0x54) } {
         return None;
     }
     let distance = (target.x - origin.x).hypot(target.y - origin.y);
+    // Retain the native stance offset and add only the requested height delta.
+    // The public result continues to report the ground origin for ABI stability.
+    let trace_origin = CokeRangePoint {
+        z: origin.z + (source_height - NATIVE_OBSERVER_HEIGHT),
+        ..origin
+    };
     let mut visible_fraction = 1.0;
     let mut status = RANGE_CLEAR;
-    if distance >= 0.25 && !unsafe { trace(native, context, origin, target) } {
+    if distance >= 0.25 && !unsafe { trace(native, context, trace_origin, target) } {
         status = RANGE_BLOCKED;
         let mut blocked = 1.0;
         visible_fraction = 0.0;
         // Match the native preview's roughly three-metre refinement bound.
         while (blocked - visible_fraction) * distance > 3.0 {
             let middle = (visible_fraction + blocked) * 0.5;
-            if unsafe { trace(native, context, origin, between(origin, target, middle)) } {
+            if unsafe {
+                trace(
+                    native,
+                    context,
+                    trace_origin,
+                    between(trace_origin, target, middle),
+                )
+            } {
                 visible_fraction = middle;
             } else {
                 blocked = middle;
@@ -719,12 +1082,18 @@ unsafe fn trace(native: Native, context: usize, a: CokeRangePoint, b: CokeRangeP
     }
 }
 
-unsafe fn draw(native: Native, owner: usize, result: CokeRangeResult, now: u32) {
+unsafe fn draw(
+    native: Native,
+    owner: usize,
+    result: CokeRangeResult,
+    now: u32,
+    source_height: f32,
+) {
     if unsafe { rd_u32(owner + 0xc99c) }.is_none_or(|p| p == 0) {
         return;
     }
     let a = CokeRangePoint {
-        z: result.origin.z + OBSERVER_HEIGHT,
+        z: result.origin.z + source_height,
         ..result.origin
     };
     let b = result.target;

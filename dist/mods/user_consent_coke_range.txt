@@ -1,0 +1,1 @@
+Coke mod consent: this file lets opengl32.dll load coke_range.dll from the game coke folder.
