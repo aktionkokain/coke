@@ -759,7 +759,15 @@ pub unsafe extern "system" fn hook_async_key_state(vk: i32) -> i16 {
             set_camera_rmb_held(state < 0);
             return 0;
         }
+        if camera_input_capture() && vk == 0x04 {
+            return 0;
+        }
         if camera_input_capture() && matches!(vk, 0x41 | 0x44 | 0x53 | 0x57) {
+            return 0;
+        }
+        if camera_input_capture() && camera_freecam_active() && matches!(vk, 0x52 | 0x46) {
+            // In free-camera mode R/F become vertical flight controls owned by
+            // the submod instead of the engine's elevation bindings.
             return 0;
         }
         state

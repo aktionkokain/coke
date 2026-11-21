@@ -788,20 +788,37 @@ pub unsafe extern "system" fn custom_wndproc(
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN
             | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP
             | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN | WM_XBUTTONUP => {
-                if camera_input_capture() && msg == WM_RBUTTONDOWN {
+                if camera_input_capture() && matches!(msg, WM_RBUTTONDOWN | WM_RBUTTONDBLCLK) {
                     CAMERA_RMB_MESSAGE_DOWN.store(1, Ordering::Release);
                     CAMERA_RMB_DRAG_CANCELLED.store(0, Ordering::Release);
+                    CAMERA_RMB_DOWN_POINT.store(transform_client_lparam(lparam), Ordering::Release);
+                    CAMERA_RMB_DOWN_WPARAM.store(wparam as usize, Ordering::Release);
+                    CAMERA_RMB_DOWN_MESSAGE.store(msg, Ordering::Release);
+                    // Delay native right-click delivery until release. If this
+                    // becomes a drag, the engine never enters its origin-based
+                    // camera mode; coke-camera alone applies cursor deltas.
+                    return 0;
+                }
+                if camera_input_capture() && matches!(msg, WM_MBUTTONDOWN | WM_MBUTTONDBLCLK) {
+                    CAMERA_MMB_MESSAGE_DOWN.store(1, Ordering::Release);
+                    return 0;
+                }
+                if camera_input_capture() && msg == WM_MBUTTONUP {
+                    CAMERA_MMB_MESSAGE_DOWN.store(0, Ordering::Release);
+                    return 0;
+                }
+                if camera_input_capture()
+                    && msg == WM_MOUSEMOVE
+                    && CAMERA_MMB_MESSAGE_DOWN.load(Ordering::Acquire) != 0
+                {
+                    return 0;
                 }
                 if camera_input_capture() && msg == WM_MOUSEMOVE && camera_rmb_message_down() {
                     let new_lparam = transform_client_lparam(lparam);
-                    if !camera_rmb_drag_cancelled() {
-                        // A click still reaches the game. Once movement proves
-                        // this is a camera drag, release the native drag state
-                        // and let coke-camera own all subsequent deltas.
-                        // WM_RBUTTONUP's key-state flags describe the state
-                        // after release; clear MK_RBUTTON even though the
-                        // triggering WM_MOUSEMOVE still has it set.
-                        let _ = call_original(hwnd, WM_RBUTTONUP, wparam & !0x0002, new_lparam);
+                    let (down_x, down_y) =
+                        unpack_point(CAMERA_RMB_DOWN_POINT.load(Ordering::Acquire));
+                    let (move_x, move_y) = unpack_point(new_lparam);
+                    if (move_x - down_x).abs() >= 3 || (move_y - down_y).abs() >= 3 {
                         CAMERA_RMB_DRAG_CANCELLED.store(1, Ordering::Release);
                     }
                     return 0;
@@ -810,9 +827,23 @@ pub unsafe extern "system" fn custom_wndproc(
                     let cancelled = camera_rmb_drag_cancelled();
                     CAMERA_RMB_MESSAGE_DOWN.store(0, Ordering::Release);
                     CAMERA_RMB_DRAG_CANCELLED.store(0, Ordering::Release);
+                    let down_message = CAMERA_RMB_DOWN_MESSAGE.swap(0, Ordering::AcqRel);
+                    let down_wparam = CAMERA_RMB_DOWN_WPARAM.swap(0, Ordering::AcqRel) as usize;
+                    let down_lparam = CAMERA_RMB_DOWN_POINT.swap(0, Ordering::AcqRel);
+                    let up_lparam = transform_client_lparam(lparam);
                     if cancelled {
                         return 0;
                     }
+                    // It was a click rather than a drag. Replay the normal
+                    // button pair so unit-order cancellation and other native
+                    // right-click actions keep working.
+                    let down_message = if down_message == WM_RBUTTONDBLCLK {
+                        WM_RBUTTONDBLCLK
+                    } else {
+                        WM_RBUTTONDOWN
+                    };
+                    let _ = call_original(hwnd, down_message, down_wparam, down_lparam);
+                    return call_original(hwnd, WM_RBUTTONUP, wparam & !0x0002, up_lparam);
                 }
                 let new_lparam = transform_client_lparam(lparam);
                 if MOUSE_LOG.fetch_add(1, Ordering::Relaxed) < 24 {

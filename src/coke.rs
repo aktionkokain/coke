@@ -501,7 +501,9 @@ unsafe extern "system" fn host_camera_wheel_delta() -> f32 {
 }
 
 unsafe extern "system" fn host_camera_input_capture(captured: i32) -> i32 {
-    set_camera_input_capture(captured != 0);
+    // Bit 0 claims native camera input; bit 1 enables free flight and R/F
+    // suppression; bit 2 disables terrain clearance in free-camera mode.
+    set_camera_input_capture(captured);
     1
 }
 

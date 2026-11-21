@@ -812,9 +812,24 @@ unsafe fn camera_at(p: usize) -> Option<Camera> {
         // up vector and FOV are validated here.
         let dir2 = cam.dir.x * cam.dir.x + cam.dir.y * cam.dir.y + cam.dir.z * cam.dir.z;
         let up2 = cam.up.x * cam.up.x + cam.up.y * cam.up.y + cam.up.z * cam.up.z;
-        if cam.fov > 5.0 && cam.fov < 175.0 && dir2 > 0.1 && up2 > 0.1 {
+        // Native Z/X zoom can reduce the FOV to 1 degree. Rejecting values
+        // below 5 degrees detached the override at close zoom and exposed the
+        // engine's origin-based drag behavior.
+        let valid_shape = cam.fov.is_finite()
+            && (0.1..180.0).contains(&cam.fov)
+            && dir2.is_finite()
+            && up2.is_finite()
+            && dir2 > 0.1
+            && up2 > 0.1;
+        if valid_shape {
             Some(cam)
         } else {
+            if CAMERA_SHAPE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+                log(&format!(
+                    "camera: rejected shape ptr=0x{p:x} vt=0x{vt:08x} fov={:.3} dir2={dir2:.3} up2={up2:.3}",
+                    cam.fov
+                ));
+            }
             None
         }
     }
@@ -824,17 +839,21 @@ static STABLE_CAM: Mutex<Option<Camera>> = Mutex::new(None);
 static LAST_CAMERA_HEIGHT: Mutex<Option<(usize, f32)>> = Mutex::new(None);
 static CAMERA_REJECT_LOGGED: AtomicU32 = AtomicU32::new(0);
 static CAMERA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static CAMERA_SHAPE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 unsafe fn native_elevation_held() -> bool {
     unsafe {
+        if camera_freecam_active() && camera_freecam_noclip() {
+            return true;
+        }
         let real = REAL_ASYNC_KEY_STATE.load(Ordering::Acquire);
         if real == 0 {
             return false;
         }
         let f: unsafe extern "system" fn(i32) -> i16 = core::mem::transmute(real);
-        // R/F/Z/X remain native elevation/zoom controls. Q/E are masked from
-        // the engine and handled as mod yaw commands.
-        f(0x52) < 0 || f(0x46) < 0 || f(0x5a) < 0 || f(0x58) < 0
+        // R/F/Z/X remain native elevation/zoom controls. MMB is a mod-owned
+        // 3D translation, so its vertical component must not be height-guarded.
+        f(0x52) < 0 || f(0x46) < 0 || f(0x5a) < 0 || f(0x58) < 0 || f(0x04) < 0
     }
 }
 
@@ -892,23 +911,18 @@ pub unsafe fn camera() -> Option<Camera> {
     }
 }
 
-/// Resolve the camera object currently published by the renderer. It is rebuilt
-/// each frame, so the pointer must be resolved for every command.
-unsafe fn camera_with_ptr() -> Option<(usize, Camera)> {
+/// Native input routines obtain the mutable camera from the scene-owner
+/// object's +0x10 field. The canvas app has a different +0x10 field; writing
+/// its published render clones moves the view without moving tile streaming.
+unsafe fn controller_camera_with_ptr() -> Option<(usize, Camera)> {
     unsafe {
-        profile::los()?;
-        let app = los_app_ptr().and_then(|g| rd_u32(g))? as usize;
-        if app < 0x10000 || !committed(app, 0x40) {
+        let owner_global = profile::scene().and_then(|s| profile_addr(s.owner_ptr))?;
+        let owner = rd_u32(owner_global)? as usize;
+        if owner < 0x10000 || !committed(owner, 0x14) {
             return None;
         }
-        for off in [0x2c, 0x30] {
-            let Some(p) = rd_u32(app + off) else { continue };
-            let p = p as usize;
-            if let Some(cam) = camera_at(p) {
-                return Some((p, cam));
-            }
-        }
-        None
+        let ptr = rd_u32(owner + 0x10)? as usize;
+        camera_at(ptr).map(|cam| (ptr, cam))
     }
 }
 
@@ -930,8 +944,8 @@ pub unsafe fn camera_apply_command(cmd: &coke_host::CokeCameraCommand) -> bool {
         {
             return camera_reject("command bounds");
         }
-        let Some((ptr, mut cam)) = camera_with_ptr() else {
-            return camera_reject("published camera unavailable");
+        let Some((ptr, mut cam)) = controller_camera_with_ptr() else {
+            return camera_reject("controller camera unavailable");
         };
         // The native elevation path can briefly publish a floor-relative
         // camera while the mod is replacing its horizontal view. Keep a large
@@ -969,12 +983,14 @@ pub unsafe fn camera_apply_command(cmd: &coke_host::CokeCameraCommand) -> bool {
         cam.pos.y += right.y * cmd.pan_right + fwd.y * cmd.pan_forward;
         cam.pos.z += cmd.zoom;
         if let Some(t) = terrain() {
-            cam.pos.x = cam.pos.x.clamp(0.0, t.world_w);
-            cam.pos.y = cam.pos.y.clamp(0.0, t.world_h);
-            cam.pos.z = cam
-                .pos
-                .z
-                .max(terrain_height(&t, cam.pos.x, cam.pos.y) + 1.0);
+            if !(camera_freecam_active() && camera_freecam_noclip()) {
+                cam.pos.x = cam.pos.x.clamp(0.0, t.world_w);
+                cam.pos.y = cam.pos.y.clamp(0.0, t.world_h);
+                cam.pos.z = cam
+                    .pos
+                    .z
+                    .max(terrain_height(&t, cam.pos.x, cam.pos.y) + 1.0);
+            }
         }
         if guarded_height.is_some()
             && let Ok(mut last) = LAST_CAMERA_HEIGHT.lock()
@@ -1017,16 +1033,16 @@ pub unsafe fn camera_apply_command(cmd: &coke_host::CokeCameraCommand) -> bool {
             cam.dir = rotate_axis(cam.dir);
             cam.up = rotate_axis(cam.up);
         }
-        // The renderer can swap its published camera during auxiliary passes.
-        // Revalidate the object at the last moment so a freed clone is not used.
-        if camera_at(ptr).is_none() {
-            return camera_reject("published camera changed before write");
+        // Reject a battle-transition race rather than applying the command to
+        // a controller that the scene owner has replaced.
+        if controller_camera_with_ptr().is_none_or(|(current, _)| current != ptr) {
+            return camera_reject("controller changed before write");
         }
-        let ok = write_camera_fields(ptr, &cam);
+        let ok = write_controller_camera_fields(ptr, &cam);
         let n = CAMERA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 12 {
             log(&format!(
-                "camera: apply ptr=0x{ptr:x} pos=({:.1},{:.1},{:.1}) cmd=({:.2},{:.2},{:.3},{:.3},{:.2}) ok={ok}",
+                "camera: apply controller=0x{ptr:x} pos=({:.1},{:.1},{:.1}) cmd=({:.2},{:.2},{:.3},{:.3},{:.2}) ok={ok}",
                 cam.pos.x,
                 cam.pos.y,
                 cam.pos.z,
@@ -1045,15 +1061,23 @@ pub unsafe fn camera_apply_command(cmd: &coke_host::CokeCameraCommand) -> bool {
     }
 }
 
-unsafe fn write_camera_fields(ptr: usize, cam: &Camera) -> bool {
+unsafe fn write_controller_camera_fields(ptr: usize, cam: &Camera) -> bool {
     unsafe {
-        if ptr < 0x10000 || !committed(ptr, 0x48) {
+        if ptr < 0x10000 || !committed(ptr, 0x100) {
             return false;
         }
+        let relative_height = if rd_u32(ptr + 0xf8).unwrap_or(0) != 0 {
+            let Some(t) = terrain() else {
+                return false;
+            };
+            Some(cam.pos.z - terrain_height(&t, cam.pos.x, cam.pos.y))
+        } else {
+            None
+        };
         let mut old = 0u32;
         if VirtualProtect(
             ptr as *mut core::ffi::c_void,
-            0x48,
+            0x100,
             PAGE_READWRITE,
             &mut old,
         ) == 0
@@ -1068,9 +1092,19 @@ unsafe fn write_camera_fields(ptr: usize, cam: &Camera) -> bool {
         put(0x08, cam.pos);
         put(0x18, cam.dir);
         put(0x28, cam.up);
+        // Native validation rolls rejected movement back to this position.
+        put(0x4c, cam.pos);
+        if let Some(height) = relative_height {
+            core::ptr::write_unaligned((ptr + 0xf0) as *mut f32, height);
+        }
         let mut ignored = 0u32;
-        VirtualProtect(ptr as *mut core::ffi::c_void, 0x48, old, &mut ignored);
-        camera_at(ptr).is_some()
+        VirtualProtect(ptr as *mut core::ffi::c_void, 0x100, old, &mut ignored);
+        controller_camera_with_ptr().is_some_and(|(current, actual)| {
+            current == ptr
+                && (actual.pos.x - cam.pos.x).abs() < 0.05
+                && (actual.pos.y - cam.pos.y).abs() < 0.05
+                && (actual.pos.z - cam.pos.z).abs() < 0.05
+        })
     }
 }
 

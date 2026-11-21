@@ -90,9 +90,15 @@ pub static PROFILE_OK: AtomicU32 = AtomicU32::new(0);
 pub static SLOT_OK_MASK: AtomicU32 = AtomicU32::new(0);
 /// Set while a mod owns the native camera input boundary.
 pub static CAMERA_INPUT_CAPTURE: AtomicU32 = AtomicU32::new(0);
+pub static CAMERA_FREECAM_ACTIVE: AtomicU32 = AtomicU32::new(0);
+pub static CAMERA_FREECAM_NOCLIP: AtomicU32 = AtomicU32::new(0);
 pub static CAMERA_RMB_HELD: AtomicU32 = AtomicU32::new(0);
 pub static CAMERA_RMB_MESSAGE_DOWN: AtomicU32 = AtomicU32::new(0);
 pub static CAMERA_RMB_DRAG_CANCELLED: AtomicU32 = AtomicU32::new(0);
+pub static CAMERA_RMB_DOWN_POINT: AtomicIsize = AtomicIsize::new(0);
+pub static CAMERA_RMB_DOWN_WPARAM: AtomicUsize = AtomicUsize::new(0);
+pub static CAMERA_RMB_DOWN_MESSAGE: AtomicU32 = AtomicU32::new(0);
+pub static CAMERA_MMB_MESSAGE_DOWN: AtomicU32 = AtomicU32::new(0);
 pub static CAMERA_CURSOR_ANCHOR: AtomicIsize = AtomicIsize::new(0);
 pub static CAMERA_CURSOR_ANCHOR_VALID: AtomicU32 = AtomicU32::new(0);
 
@@ -100,14 +106,31 @@ pub fn camera_input_capture() -> bool {
     CAMERA_INPUT_CAPTURE.load(Ordering::Acquire) != 0
 }
 
-pub fn set_camera_input_capture(captured: bool) {
+pub fn set_camera_input_capture(mode: i32) {
+    let captured = mode & 1 != 0;
     CAMERA_INPUT_CAPTURE.store(captured as u32, Ordering::Release);
+    CAMERA_FREECAM_ACTIVE.store(((mode & 2) != 0) as u32, Ordering::Release);
+    CAMERA_FREECAM_NOCLIP.store(((mode & 4) != 0) as u32, Ordering::Release);
     if !captured {
         CAMERA_RMB_HELD.store(0, Ordering::Release);
         CAMERA_RMB_MESSAGE_DOWN.store(0, Ordering::Release);
         CAMERA_RMB_DRAG_CANCELLED.store(0, Ordering::Release);
+        CAMERA_RMB_DOWN_POINT.store(0, Ordering::Release);
+        CAMERA_RMB_DOWN_WPARAM.store(0, Ordering::Release);
+        CAMERA_RMB_DOWN_MESSAGE.store(0, Ordering::Release);
+        CAMERA_MMB_MESSAGE_DOWN.store(0, Ordering::Release);
         CAMERA_CURSOR_ANCHOR_VALID.store(0, Ordering::Release);
+        CAMERA_FREECAM_ACTIVE.store(0, Ordering::Release);
+        CAMERA_FREECAM_NOCLIP.store(0, Ordering::Release);
     }
+}
+
+pub fn camera_freecam_active() -> bool {
+    CAMERA_FREECAM_ACTIVE.load(Ordering::Acquire) != 0
+}
+
+pub fn camera_freecam_noclip() -> bool {
+    CAMERA_FREECAM_NOCLIP.load(Ordering::Acquire) != 0
 }
 
 pub fn camera_rmb_message_down() -> bool {
