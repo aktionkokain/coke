@@ -29,6 +29,12 @@ function Copy-CokeMods {
 
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
 
+    # Coke Shot is an optional standalone download, never part of the default
+    # drag-and-drop Coke package.
+    foreach ($name in @("coke_camera.dll", "coke-camera.ini", "user_consent_coke_camera.txt")) {
+        Remove-Item -LiteralPath (Join-Path $Destination $name) -Force -ErrorAction SilentlyContinue
+    }
+
     foreach ($mod in Get-CokeMods) {
         $modDir = Join-Path $root "mods\$($mod.Name)"
         if (-not (Test-Path -LiteralPath $modDir)) { continue }

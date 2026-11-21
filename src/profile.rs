@@ -578,43 +578,6 @@ pub fn validate_addresses(p: &Profile) -> Result<(), String> {
             check("los.map_globals", *g)?;
         }
     }
-    if let Some(c) = &p.camera {
-        check("camera.call_site", c.call_site)?;
-        check("camera.update_fn", c.update_fn)?;
-        if !c.call_expected.is_empty() && c.call_expected.len() != 5 {
-            return Err("camera.call_expected must contain exactly 5 bytes".to_string());
-        }
-        if !c.call_expected.is_empty() && c.call_expected[0] != 0xe8 {
-            return Err("camera.call_expected must start with the CALL opcode".to_string());
-        }
-        for (what, site, expected) in [
-            (
-                "camera.pan_ramp_site",
-                c.pan_ramp_site,
-                &c.pan_ramp_expected,
-            ),
-            (
-                "camera.drag_yaw_site",
-                c.drag_yaw_site,
-                &c.drag_yaw_expected,
-            ),
-        ] {
-            if site != 0 {
-                if expected.is_empty() {
-                    return Err(format!("{what} needs expected bytes"));
-                }
-                if site.saturating_add(expected.len() as u32) > size {
-                    return Err(format!("{what} patch span exceeds the image"));
-                }
-                check(what, site)?;
-            } else if !expected.is_empty() {
-                return Err(format!("{what} has expected bytes but no site"));
-            }
-        }
-        if c.call_site.saturating_add(5) > size {
-            return Err("camera.call_site patch span exceeds the image".to_string());
-        }
-    }
     Ok(())
 }
 
@@ -800,7 +763,6 @@ fn same_facts(a: &Profile, b: &Profile) -> bool {
         && a.scene == b.scene
         && a.rtti == b.rtti
         && a.los == b.los
-        && a.camera == b.camera
 }
 
 /// Outcome of profile selection.

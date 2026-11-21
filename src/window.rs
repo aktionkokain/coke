@@ -788,6 +788,32 @@ pub unsafe extern "system" fn custom_wndproc(
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN
             | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP
             | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                if camera_input_capture() && msg == WM_RBUTTONDOWN {
+                    CAMERA_RMB_MESSAGE_DOWN.store(1, Ordering::Release);
+                    CAMERA_RMB_DRAG_CANCELLED.store(0, Ordering::Release);
+                }
+                if camera_input_capture() && msg == WM_MOUSEMOVE && camera_rmb_message_down() {
+                    let new_lparam = transform_client_lparam(lparam);
+                    if !camera_rmb_drag_cancelled() {
+                        // A click still reaches the game. Once movement proves
+                        // this is a camera drag, release the native drag state
+                        // and let coke-camera own all subsequent deltas.
+                        // WM_RBUTTONUP's key-state flags describe the state
+                        // after release; clear MK_RBUTTON even though the
+                        // triggering WM_MOUSEMOVE still has it set.
+                        let _ = call_original(hwnd, WM_RBUTTONUP, wparam & !0x0002, new_lparam);
+                        CAMERA_RMB_DRAG_CANCELLED.store(1, Ordering::Release);
+                    }
+                    return 0;
+                }
+                if camera_input_capture() && msg == WM_RBUTTONUP {
+                    let cancelled = camera_rmb_drag_cancelled();
+                    CAMERA_RMB_MESSAGE_DOWN.store(0, Ordering::Release);
+                    CAMERA_RMB_DRAG_CANCELLED.store(0, Ordering::Release);
+                    if cancelled {
+                        return 0;
+                    }
+                }
                 let new_lparam = transform_client_lparam(lparam);
                 if MOUSE_LOG.fetch_add(1, Ordering::Relaxed) < 24 {
                     let rx = (lparam & 0xffff) as i16 as i32;
@@ -806,6 +832,10 @@ pub unsafe extern "system" fn custom_wndproc(
                 return call_original(hwnd, msg, wparam, new_lparam);
             }
             WM_MOUSEWHEEL => {
+                coke_note_wheel(((wparam >> 16) & 0xffff) as u16 as i16 as i32 / 120);
+                if camera_input_capture() {
+                    return 0;
+                }
                 // Wheel messages carry screen coordinates, unlike the other mouse messages.
                 let new_lparam = transform_screen_lparam(hwnd, lparam);
                 return call_original(hwnd, msg, wparam, new_lparam);

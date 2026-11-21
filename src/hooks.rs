@@ -130,7 +130,17 @@ pub unsafe extern "system" fn hook_get_cursor_pos(pt: *mut Point) -> i32 {
         }
         let (cx, cy) = ((*pt).x - origin.x, (*pt).y - origin.y);
         let (gx, gy) = guard_drag_cursor(hwnd, cx, cy);
-        let (lx, ly) = client_to_logical(gx, gy);
+        let (mut lx, mut ly) = client_to_logical(gx, gy);
+        if camera_input_capture() && camera_rmb_held() {
+            if CAMERA_CURSOR_ANCHOR_VALID.load(Ordering::Acquire) == 0 {
+                CAMERA_CURSOR_ANCHOR.store(pack_point(lx, ly), Ordering::Release);
+                CAMERA_CURSOR_ANCHOR_VALID.store(1, Ordering::Release);
+            } else {
+                let (ax, ay) = unpack_point(CAMERA_CURSOR_ANCHOR.load(Ordering::Acquire));
+                lx = ax;
+                ly = ay;
+            }
+        }
         static GCP_LOG: AtomicU32 = AtomicU32::new(0);
         if GCP_LOG.fetch_add(1, Ordering::Relaxed) < 5 {
             let (sx, sy) = scale_xy();

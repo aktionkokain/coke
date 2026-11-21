@@ -821,6 +821,29 @@ unsafe fn camera_at(p: usize) -> Option<Camera> {
 }
 
 static STABLE_CAM: Mutex<Option<Camera>> = Mutex::new(None);
+static LAST_CAMERA_HEIGHT: Mutex<Option<(usize, f32)>> = Mutex::new(None);
+static CAMERA_REJECT_LOGGED: AtomicU32 = AtomicU32::new(0);
+static CAMERA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn native_elevation_held() -> bool {
+    unsafe {
+        let real = REAL_ASYNC_KEY_STATE.load(Ordering::Acquire);
+        if real == 0 {
+            return false;
+        }
+        let f: unsafe extern "system" fn(i32) -> i16 = core::mem::transmute(real);
+        // R/F/Z/X remain native elevation/zoom controls. Q/E are masked from
+        // the engine and handled as mod yaw commands.
+        f(0x52) < 0 || f(0x46) < 0 || f(0x5a) < 0 || f(0x58) < 0
+    }
+}
+
+fn camera_reject(reason: &str) -> bool {
+    if CAMERA_REJECT_LOGGED.swap(1, Ordering::Relaxed) == 0 {
+        log(&format!("camera: apply rejected: {reason}"));
+    }
+    false
+}
 
 /// The camera for the overlay. A transient failed read reuses the last good
 /// camera instead of blanking the overlay for a frame.
@@ -866,6 +889,188 @@ pub unsafe fn camera() -> Option<Camera> {
             }
         }
         None
+    }
+}
+
+/// Resolve the camera object currently published by the renderer. It is rebuilt
+/// each frame, so the pointer must be resolved for every command.
+unsafe fn camera_with_ptr() -> Option<(usize, Camera)> {
+    unsafe {
+        profile::los()?;
+        let app = los_app_ptr().and_then(|g| rd_u32(g))? as usize;
+        if app < 0x10000 || !committed(app, 0x40) {
+            return None;
+        }
+        for off in [0x2c, 0x30] {
+            let Some(p) = rd_u32(app + off) else { continue };
+            let p = p as usize;
+            if let Some(cam) = camera_at(p) {
+                return Some((p, cam));
+            }
+        }
+        None
+    }
+}
+
+/// Write the live camera's view fields after re-validating its vtable and
+/// numeric contents. This is the only host-side mutation exposed to `/coke/`
+/// mods; callers never receive the raw pointer or build-specific offsets.
+pub unsafe fn camera_apply_command(cmd: &coke_host::CokeCameraCommand) -> bool {
+    unsafe {
+        if !cmd.pan_right.is_finite()
+            || !cmd.pan_forward.is_finite()
+            || !cmd.yaw.is_finite()
+            || !cmd.pitch.is_finite()
+            || !cmd.zoom.is_finite()
+            || cmd.pan_right.abs() > 50.0
+            || cmd.pan_forward.abs() > 50.0
+            || cmd.yaw.abs() > 0.5
+            || cmd.pitch.abs() > 0.5
+            || cmd.zoom.abs() > 50.0
+        {
+            return camera_reject("command bounds");
+        }
+        let Some((ptr, mut cam)) = camera_with_ptr() else {
+            return camera_reject("published camera unavailable");
+        };
+        // The native elevation path can briefly publish a floor-relative
+        // camera while the mod is replacing its horizontal view. Keep a large
+        // one-frame drop from turning a valid RTS view into a ground-level
+        // view, while still allowing normal R/F and wheel elevation changes.
+        let mut guarded_height = None;
+        if let Ok(last) = LAST_CAMERA_HEIGHT.lock() {
+            if let Some((old_ptr, old_z)) = *last {
+                // R/F stays native. When neither key is down, however, the
+                // engine's idle camera update must not replace a wheel-driven
+                // height or slowly walk the camera down to the terrain.
+                if old_ptr == ptr && !native_elevation_held() && (cam.pos.z - old_z).abs() > 0.05 {
+                    cam.pos.z = old_z;
+                }
+            }
+            guarded_height = Some(());
+        }
+        let mut fwd = Vec3 {
+            x: cam.dir.x,
+            y: cam.dir.y,
+            z: 0.0,
+        };
+        let fl = (fwd.x * fwd.x + fwd.y * fwd.y).sqrt();
+        if fl <= 1.0e-5 {
+            return camera_reject("camera direction invalid");
+        }
+        fwd.x /= fl;
+        fwd.y /= fl;
+        let right = Vec3 {
+            x: fwd.y,
+            y: -fwd.x,
+            z: 0.0,
+        };
+        cam.pos.x += right.x * cmd.pan_right + fwd.x * cmd.pan_forward;
+        cam.pos.y += right.y * cmd.pan_right + fwd.y * cmd.pan_forward;
+        cam.pos.z += cmd.zoom;
+        if let Some(t) = terrain() {
+            cam.pos.x = cam.pos.x.clamp(0.0, t.world_w);
+            cam.pos.y = cam.pos.y.clamp(0.0, t.world_h);
+            cam.pos.z = cam
+                .pos
+                .z
+                .max(terrain_height(&t, cam.pos.x, cam.pos.y) + 1.0);
+        }
+        if guarded_height.is_some()
+            && let Ok(mut last) = LAST_CAMERA_HEIGHT.lock()
+        {
+            *last = Some((ptr, cam.pos.z));
+        }
+
+        let (sin_y, cos_y) = cmd.yaw.sin_cos();
+        let rotate_z = |v: Vec3| Vec3 {
+            x: v.x * cos_y - v.y * sin_y,
+            y: v.x * sin_y + v.y * cos_y,
+            z: v.z,
+        };
+        cam.dir = rotate_z(cam.dir);
+        cam.up = rotate_z(cam.up);
+
+        // Pitch about the camera's right axis. Re-normalisation is deliberately
+        // omitted; the native camera keeps these basis vectors near unit length
+        // and the small bounded command avoids accumulating useful error.
+        if cmd.pitch != 0.0 {
+            let axis = Vec3 {
+                x: cam.dir.y * cam.up.z - cam.dir.z * cam.up.y,
+                y: cam.dir.z * cam.up.x - cam.dir.x * cam.up.z,
+                z: cam.dir.x * cam.up.y - cam.dir.y * cam.up.x,
+            };
+            let (sin_p, cos_p) = cmd.pitch.sin_cos();
+            let rotate_axis = |v: Vec3| {
+                let dot = v.x * axis.x + v.y * axis.y + v.z * axis.z;
+                let cross = Vec3 {
+                    x: axis.y * v.z - axis.z * v.y,
+                    y: axis.z * v.x - axis.x * v.z,
+                    z: axis.x * v.y - axis.y * v.x,
+                };
+                Vec3 {
+                    x: v.x * cos_p + cross.x * sin_p + axis.x * dot * (1.0 - cos_p),
+                    y: v.y * cos_p + cross.y * sin_p + axis.y * dot * (1.0 - cos_p),
+                    z: v.z * cos_p + cross.z * sin_p + axis.z * dot * (1.0 - cos_p),
+                }
+            };
+            cam.dir = rotate_axis(cam.dir);
+            cam.up = rotate_axis(cam.up);
+        }
+        // The renderer can swap its published camera during auxiliary passes.
+        // Revalidate the object at the last moment so a freed clone is not used.
+        if camera_at(ptr).is_none() {
+            return camera_reject("published camera changed before write");
+        }
+        let ok = write_camera_fields(ptr, &cam);
+        let n = CAMERA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 12 {
+            log(&format!(
+                "camera: apply ptr=0x{ptr:x} pos=({:.1},{:.1},{:.1}) cmd=({:.2},{:.2},{:.3},{:.3},{:.2}) ok={ok}",
+                cam.pos.x,
+                cam.pos.y,
+                cam.pos.z,
+                cmd.pan_right,
+                cmd.pan_forward,
+                cmd.yaw,
+                cmd.pitch,
+                cmd.zoom
+            ));
+        }
+        if ok {
+            true
+        } else {
+            camera_reject("camera write verification failed")
+        }
+    }
+}
+
+unsafe fn write_camera_fields(ptr: usize, cam: &Camera) -> bool {
+    unsafe {
+        if ptr < 0x10000 || !committed(ptr, 0x48) {
+            return false;
+        }
+        let mut old = 0u32;
+        if VirtualProtect(
+            ptr as *mut core::ffi::c_void,
+            0x48,
+            PAGE_READWRITE,
+            &mut old,
+        ) == 0
+        {
+            return false;
+        }
+        let put = |off: usize, v: Vec3| {
+            core::ptr::write_unaligned((ptr + off) as *mut f32, v.x);
+            core::ptr::write_unaligned((ptr + off + 4) as *mut f32, v.y);
+            core::ptr::write_unaligned((ptr + off + 8) as *mut f32, v.z);
+        };
+        put(0x08, cam.pos);
+        put(0x18, cam.dir);
+        put(0x28, cam.up);
+        let mut ignored = 0u32;
+        VirtualProtect(ptr as *mut core::ffi::c_void, 0x48, old, &mut ignored);
+        camera_at(ptr).is_some()
     }
 }
 

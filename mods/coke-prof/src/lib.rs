@@ -34,7 +34,7 @@ use coke_host::CokeHost;
 static HOST: OnceLock<CokeHost> = OnceLock::new();
 static HUD_MODE: AtomicU32 = AtomicU32::new(0);
 
-const _: () = assert!(core::mem::size_of::<CokeHost>() == 132);
+const _: () = assert!(core::mem::size_of::<CokeHost>() == 144);
 const _: () = assert!(core::mem::size_of::<CokeProfStats>() == 216);
 
 fn host() -> Option<&'static CokeHost> {
@@ -795,7 +795,7 @@ pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
             return 0;
         }
         let h = &*host;
-        if h.api_version < 2 || (h.size as usize) < core::mem::size_of::<CokeHost>() {
+        if h.api_version < 2 || (h.size as usize) < coke_host::COKE_HOST_V4_SIZE {
             return 0;
         }
         if HOST.set(*h).is_err() {

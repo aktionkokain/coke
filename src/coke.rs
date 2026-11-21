@@ -22,6 +22,7 @@ use std::ffi::{CStr, c_char};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
+static CAMERA_WHEEL_NOTCHES: AtomicI32 = AtomicI32::new(0);
 const MAX_MOD_BUFFER: usize = 4 * 1024 * 1024;
 
 /// Validate a native mod's output buffer before turning it into a Rust slice.
@@ -84,7 +85,9 @@ unsafe fn valid_mod_buffer(
 // The ABI types live in `crates/coke-host` so the proxy and every mod share
 // one definition. Re-exported here because the rest of the crate reaches them
 // through `crate::*`.
-pub use coke_host::{COKE_HOST_API, CokeCamera, CokeHost, CokeTerrain, WorldVertex};
+pub use coke_host::{
+    COKE_HOST_API, CokeCamera, CokeCameraCommand, CokeHost, CokeTerrain, WorldVertex,
+};
 
 unsafe extern "system" fn host_log(msg: *const c_char) {
     unsafe {
@@ -393,6 +396,9 @@ unsafe extern "system" fn host_focused() -> i32 {
         if fg.is_null() {
             return 0;
         }
+        if IsIconic(fg) != 0 {
+            return 0;
+        }
         let mut pid = 0u32;
         if GetWindowThreadProcessId(fg, &mut pid) == 0 {
             return 0;
@@ -481,6 +487,31 @@ unsafe extern "system" fn host_cursor_ground(x: *mut f32, y: *mut f32, z: *mut f
     }
 }
 
+unsafe extern "system" fn host_camera_apply(cmd: *const CokeCameraCommand) -> i32 {
+    unsafe {
+        if cmd.is_null() {
+            return 0;
+        }
+        camera_apply_command(&*cmd) as i32
+    }
+}
+
+unsafe extern "system" fn host_camera_wheel_delta() -> f32 {
+    CAMERA_WHEEL_NOTCHES.swap(0, Ordering::Relaxed) as f32
+}
+
+unsafe extern "system" fn host_camera_input_capture(captured: i32) -> i32 {
+    set_camera_input_capture(captured != 0);
+    1
+}
+
+/// Record wheel input for camera mods before the native window procedure
+/// consumes it. Mods decide whether to use the delta; the host never changes
+/// native wheel behavior on their behalf.
+pub fn coke_note_wheel(notches: i32) {
+    CAMERA_WHEEL_NOTCHES.fetch_add(notches.clamp(-120, 120), Ordering::Relaxed);
+}
+
 /// Set while a mod's `coke_init` runs, so `set_layer` knows which mod it means.
 static INIT_ACTIVE: AtomicU32 = AtomicU32::new(0);
 static PENDING_LAYER: AtomicI32 = AtomicI32::new(0);
@@ -537,6 +568,9 @@ static COKE_HOST: CokeHost = CokeHost {
     los_scan_map: Some(host_los_scan_map),
     register_hotkey: Some(host_register_hotkey),
     set_layer: Some(host_set_layer),
+    camera_apply: Some(host_camera_apply),
+    camera_wheel_delta: Some(host_camera_wheel_delta),
+    camera_input_capture: Some(host_camera_input_capture),
 };
 
 type CokeFrameFn = unsafe extern "system" fn(i32, i32, f32);
@@ -865,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn host_api_reports_v4() {
-        assert_eq!(COKE_HOST.api_version, 4);
+    fn host_api_reports_v6() {
+        assert_eq!(COKE_HOST.api_version, 6);
     }
 }

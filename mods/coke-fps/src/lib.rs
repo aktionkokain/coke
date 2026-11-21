@@ -65,7 +65,7 @@ pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
         // API v4 adds the host-owned hotkey bus. Older proxies get the counter
         // without a toggle so the sample stays compatible in both directions.
         let mut hotkey = "unavailable (host < v4)";
-        if h.api_version >= 4 && (h.size as usize) >= core::mem::size_of::<CokeHost>() {
+        if h.api_version >= 4 && (h.size as usize) >= coke_host::COKE_HOST_V4_SIZE {
             hotkey = "F10";
             if let Some(register) = h.register_hotkey {
                 if register(VK_F10, Some(toggle)) == 0 {

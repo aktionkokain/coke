@@ -551,10 +551,10 @@ pub unsafe fn scan_slots() {
         }
 
         let mask = SLOT_OK_MASK.load(Ordering::Relaxed);
-        let mut reals = [0usize; 6];
-        let mut hooks = [0usize; 6];
-        let mut counts = [0u32; 6];
-        let mut first = [0usize; 6];
+        let mut reals = [0usize; 7];
+        let mut hooks = [0usize; 7];
+        let mut counts = [0u32; 7];
+        let mut first = [0usize; 7];
         let mut n = 0usize;
 
         let mut add = |real: usize, hook: usize| {
@@ -601,6 +601,12 @@ pub unsafe fn scan_slots() {
             add(
                 REAL_SHOW_WINDOW_ASYNC.load(Ordering::Relaxed),
                 hook_show_window_async as *const () as usize,
+            );
+        }
+        if REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed) != 0 {
+            add(
+                REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed),
+                hook_async_key_state as *const () as usize,
             );
         }
         if n == 0 {
@@ -686,6 +692,12 @@ pub unsafe fn scan_slots() {
                     "IAT scan: ShowWindowAsync slot(s) patched: {}",
                     counts[i]
                 ));
+            } else if real == REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed) {
+                SCAN_ASYNC_KEY.store(1, Ordering::Relaxed);
+                log(&format!(
+                    "IAT scan: GetAsyncKeyState slot(s) patched: {}",
+                    counts[i]
+                ));
             } else {
                 let name = if real == REAL_CLOSE_WINDOW.load(Ordering::Relaxed) {
                     new_mask |= SLOT_BIT_CLOSE_WINDOW;
@@ -723,6 +735,35 @@ pub fn slots_pending() -> bool {
         || (mask & SLOT_BIT_GET_CURSOR_POS == 0 && REAL_GET_CURSOR_POS.load(Ordering::Relaxed) != 0)
         || (mask & SLOT_BIT_CHANGE_DISPLAY == 0 && REAL_CHANGE_DISPLAY.load(Ordering::Relaxed) != 0)
         || (mask & SLOT_BIT_CLOSE_WINDOW == 0 && REAL_CLOSE_WINDOW.load(Ordering::Relaxed) != 0)
+        || (SCAN_ASYNC_KEY.load(Ordering::Relaxed) == 0
+            && REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed) != 0)
+}
+
+/// Return neutral state for camera keys/buttons while a mod owns the camera.
+/// The mod DLL reads user32 directly, so this only affects engine IAT sites.
+pub unsafe extern "system" fn hook_async_key_state(vk: i32) -> i16 {
+    let real = REAL_ASYNC_KEY_STATE.load(Ordering::Acquire);
+    if real == 0 {
+        return 0;
+    }
+    unsafe {
+        let f: unsafe extern "system" fn(i32) -> i16 = core::mem::transmute(real);
+        let state = f(vk);
+        if camera_input_capture() && matches!(vk, 0x51 | 0x45) {
+            // Q/E belong to the camera submod while capture is active. Never
+            // let the game's configurable native action map turn them into
+            // elevation commands or synthetic yaw inputs.
+            return 0;
+        }
+        if camera_input_capture() && vk == 0x02 {
+            set_camera_rmb_held(state < 0);
+            return 0;
+        }
+        if camera_input_capture() && matches!(vk, 0x41 | 0x44 | 0x53 | 0x57) {
+            return 0;
+        }
+        state
+    }
 }
 
 #[cfg(test)]

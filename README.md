@@ -85,6 +85,10 @@ The default mods are built into [`dist/mods/`](dist/mods) with their consent
 files. Copy that folder's contents into the game's `coke\` folder to enable
 them.
 
+**Coke Shot**, the optional RTS camera mod, is distributed separately as
+[`dist/Coke-Shot.zip`](dist/Coke-Shot.zip). It is enabled by default after you
+install that add-on. It is not part of `dist/mods/` or the base game install.
+
 </div>
 
 <div align="center">

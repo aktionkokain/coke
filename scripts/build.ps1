@@ -31,13 +31,36 @@ try {
         }
     }
 
+    # Build Coke Shot independently. Package it as an explicit optional
+    # download instead of copying it into dist\mods with the base Coke mods.
+    $cameraDir = Join-Path $root "mods\coke-camera"
+    if (Test-Path $cameraDir) {
+        Write-Host "== optional mod: Coke Shot =="
+        Push-Location $cameraDir
+        try {
+            cargo build --release
+            if ($LASTEXITCODE -ne 0) { throw "Coke Shot build failed" }
+        } finally {
+            Pop-Location
+        }
+        $optionalDir = Join-Path $root "dist\staging\Coke Shot"
+        New-Item -ItemType Directory -Path $optionalDir -Force | Out-Null
+        Copy-Item (Join-Path $cameraDir "target\i686-pc-windows-msvc\release\coke_camera.dll") $optionalDir -Force
+        Copy-Item (Join-Path $cameraDir "coke-camera.ini") $optionalDir -Force
+        Copy-Item (Join-Path $cameraDir "README.md") (Join-Path $optionalDir "README.txt") -Force
+        Set-Content -LiteralPath (Join-Path $optionalDir "user_consent_coke_camera.txt") -Value "Coke Shot enabled by explicit installation." -Encoding ascii
+        $zip = Join-Path $root "dist\Coke-Shot.zip"
+        if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+        Compress-Archive -Path (Join-Path $optionalDir "*") -DestinationPath $zip
+    }
+
     $modsOut = Join-Path $root "dist\mods"
     Write-Host "== mods: $modsOut =="
     Copy-CokeMods -Destination $modsOut
 
     Write-Host ""
     Write-Host "Proxy: target\i686-pc-windows-msvc\release\$($names.proxy_dll)"
-    Write-Host "Mods : dist\mods\ (DLL, .ini and user_consent_*.txt for each default mod)"
+    Write-Host "Mods : dist\mods\ (base mods; Coke Shot is separate in dist\Coke-Shot.zip)"
 } finally {
     Pop-Location
 }

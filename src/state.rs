@@ -74,6 +74,7 @@ pub static REAL_CLOSE_WINDOW: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_METRICS: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_CHANGE_DISPLAY: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GET_CURSOR_POS: AtomicUsize = AtomicUsize::new(0);
+pub static REAL_ASYNC_KEY_STATE: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_SHOW_WINDOW: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_SHOW_WINDOW_ASYNC: AtomicUsize = AtomicUsize::new(0);
 
@@ -87,6 +88,46 @@ pub static PROFILE_OK: AtomicU32 = AtomicU32::new(0);
 /// A slot is only rewritten when its current value still points at the real
 /// user32 function.
 pub static SLOT_OK_MASK: AtomicU32 = AtomicU32::new(0);
+/// Set while a mod owns the native camera input boundary.
+pub static CAMERA_INPUT_CAPTURE: AtomicU32 = AtomicU32::new(0);
+pub static CAMERA_RMB_HELD: AtomicU32 = AtomicU32::new(0);
+pub static CAMERA_RMB_MESSAGE_DOWN: AtomicU32 = AtomicU32::new(0);
+pub static CAMERA_RMB_DRAG_CANCELLED: AtomicU32 = AtomicU32::new(0);
+pub static CAMERA_CURSOR_ANCHOR: AtomicIsize = AtomicIsize::new(0);
+pub static CAMERA_CURSOR_ANCHOR_VALID: AtomicU32 = AtomicU32::new(0);
+
+pub fn camera_input_capture() -> bool {
+    CAMERA_INPUT_CAPTURE.load(Ordering::Acquire) != 0
+}
+
+pub fn set_camera_input_capture(captured: bool) {
+    CAMERA_INPUT_CAPTURE.store(captured as u32, Ordering::Release);
+    if !captured {
+        CAMERA_RMB_HELD.store(0, Ordering::Release);
+        CAMERA_RMB_MESSAGE_DOWN.store(0, Ordering::Release);
+        CAMERA_RMB_DRAG_CANCELLED.store(0, Ordering::Release);
+        CAMERA_CURSOR_ANCHOR_VALID.store(0, Ordering::Release);
+    }
+}
+
+pub fn camera_rmb_message_down() -> bool {
+    CAMERA_RMB_MESSAGE_DOWN.load(Ordering::Acquire) != 0
+}
+
+pub fn camera_rmb_drag_cancelled() -> bool {
+    CAMERA_RMB_DRAG_CANCELLED.load(Ordering::Acquire) != 0
+}
+
+pub fn camera_rmb_held() -> bool {
+    CAMERA_RMB_HELD.load(Ordering::Acquire) != 0
+}
+
+pub fn set_camera_rmb_held(held: bool) {
+    CAMERA_RMB_HELD.store(held as u32, Ordering::Release);
+    if !held {
+        CAMERA_CURSOR_ANCHOR_VALID.store(0, Ordering::Release);
+    }
+}
 
 pub const SLOT_BIT_CLOSE_WINDOW: u32 = 1 << 0;
 pub const SLOT_BIT_GET_SYSTEM_METRICS: u32 = 1 << 1;
@@ -104,6 +145,7 @@ pub static SCAN_TICKS: AtomicU32 = AtomicU32::new(0);
 pub static LAST_SCAN_MS: AtomicU32 = AtomicU32::new(0);
 pub static SCAN_SHOW: AtomicU32 = AtomicU32::new(0);
 pub static SCAN_SHOW_ASYNC: AtomicU32 = AtomicU32::new(0);
+pub static SCAN_ASYNC_KEY: AtomicU32 = AtomicU32::new(0);
 pub static MAXIMIZE_LOGGED: AtomicU32 = AtomicU32::new(0);
 pub static IDENTITY_LOGGED: AtomicU32 = AtomicU32::new(0);
 pub static CLOSE_LOGGED: AtomicU32 = AtomicU32::new(0);

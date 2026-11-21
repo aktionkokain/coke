@@ -7,7 +7,9 @@ param(
     [string]$GameDir = "",
     # Executable name, e.g. "CM Cold War.exe". Detected when omitted.
     [string]$Exe = "",
-    [switch]$WithMods
+    [switch]$WithMods,
+    # Coke Shot is a separate optional download; request it explicitly.
+    [switch]$WithCameraMod
 )
 
 $ErrorActionPreference = "Stop"
@@ -103,12 +105,16 @@ if (Test-Path $profileSrc) {
 $coke = Join-Path $GameDir $names.mod_dir
 New-Item -ItemType Directory -Path $coke -Force | Out-Null
 
-if ($WithMods) {
-    $mods = @(
-        @{ Dir = "coke-fps"; Dll = "coke_fps.dll" },
-        @{ Dir = "coke-los"; Dll = "cokelos.dll" },
-        @{ Dir = "coke-prof"; Dll = "coke_prof.dll" }
-    )
+if ($WithMods -or $WithCameraMod) {
+    $mods = @()
+    if ($WithMods) {
+        $mods += @(
+            @{ Dir = "coke-fps"; Dll = "coke_fps.dll" },
+            @{ Dir = "coke-los"; Dll = "cokelos.dll" },
+            @{ Dir = "coke-prof"; Dll = "coke_prof.dll" }
+        )
+    }
+    if ($WithCameraMod) { $mods += @{ Dir = "coke-camera"; Dll = "coke_camera.dll" } }
     foreach ($mod in $mods) {
         $modDll = Join-Path $root "mods\$($mod.Dir)\target\i686-pc-windows-msvc\release\$($mod.Dll)"
         if (Test-Path $modDll) {
@@ -122,6 +128,15 @@ if ($WithMods) {
     if (Test-Path $profIni) {
         Copy-Item $profIni (Join-Path $GameDir "coke-prof.ini") -Force
         Copy-Item $profIni (Join-Path $coke "coke-prof.ini") -Force
+    }
+    if ($WithCameraMod) {
+        $cameraIni = Join-Path $root "mods\coke-camera\coke-camera.ini"
+        if (Test-Path $cameraIni) {
+            Copy-Item $cameraIni (Join-Path $coke "coke-camera.ini") -Force
+        }
+        $cameraConsent = Join-Path $coke "user_consent_coke_camera.txt"
+        Set-Content -LiteralPath $cameraConsent -Value "Coke Shot enabled by explicit installation." -Encoding ascii
+        Write-Host "Installed Coke Shot (enabled by default)"
     }
 }
 

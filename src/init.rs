@@ -96,6 +96,10 @@ pub unsafe fn init(instance: Hmodule) {
                 Ordering::Relaxed,
             );
             REAL_GET_CURSOR_POS.store(resolve(user32, "GetCursorPos") as usize, Ordering::Relaxed);
+            REAL_ASYNC_KEY_STATE.store(
+                resolve(user32, "GetAsyncKeyState") as usize,
+                Ordering::Relaxed,
+            );
             REAL_SHOW_WINDOW.store(resolve(user32, "ShowWindow") as usize, Ordering::Relaxed);
             REAL_SHOW_WINDOW_ASYNC.store(
                 resolve(user32, "ShowWindowAsync") as usize,

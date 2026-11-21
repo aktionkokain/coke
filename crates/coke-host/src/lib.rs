@@ -13,16 +13,19 @@
 use core::ffi::c_char;
 
 /// Current host API version. Bumped whenever the table grows.
-pub const COKE_HOST_API: u32 = 4;
+pub const COKE_HOST_API: u32 = 6;
 
 /// Size of the API v2.1 prefix (everything up to and including `los_scan_map`).
 ///
 /// Mods that support older proxies compare the host-reported `size` against
 /// this instead of `size_of::<CokeHost>()`, so they keep working with a host
-/// that does not provide the v4 tail. The last two fields (`register_hotkey`,
-/// `set_layer`) are the only ones added after v2.1.
+/// that does not provide the v4 or v5 tail.
 pub const COKE_HOST_V2_1_SIZE: usize =
-    core::mem::size_of::<CokeHost>() - 2 * core::mem::size_of::<usize>();
+    core::mem::size_of::<CokeHost>() - 5 * core::mem::size_of::<usize>();
+
+/// Size through the v4 tail, excluding the v5 camera extensions.
+pub const COKE_HOST_V4_SIZE: usize =
+    core::mem::size_of::<CokeHost>() - 3 * core::mem::size_of::<usize>();
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -34,6 +37,21 @@ pub struct CokeCamera {
     pub aspect: f32,
     pub near: f32,
     pub far: f32,
+}
+
+/// One bounded camera command in engine coordinates.
+///
+/// `pan_right` and `pan_forward` are horizontal world-space metres for one
+/// host call. `yaw` and `pitch` are radians. `zoom` is a signed world-space
+/// elevation delta; hosts may clamp or reject it at terrain clearance.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CokeCameraCommand {
+    pub pan_right: f32,
+    pub pan_forward: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub zoom: f32,
 }
 
 #[repr(C)]
@@ -93,6 +111,9 @@ pub type LosScanMapFn = unsafe extern "system" fn(
 pub type RegisterHotkeyFn =
     unsafe extern "system" fn(i32, Option<unsafe extern "system" fn()>) -> i32;
 
+pub type CameraApplyFn = unsafe extern "system" fn(*const CokeCameraCommand) -> i32;
+pub type CameraWheelFn = unsafe extern "system" fn() -> f32;
+
 /// Host services exposed to a `coke` mod. `#[repr(C)]` so a C or Rust DLL can
 /// use the same layout. See the module docs for the append-only rule.
 #[repr(C)]
@@ -149,4 +170,12 @@ pub struct CokeHost {
     /// layers draw later (on top). Mods that never call it use layer 0 and keep
     /// their deterministic load order.
     pub set_layer: Option<unsafe extern "system" fn(i32)>,
+
+    // ---- v5 (appended; mods must check `api_version` and `size`) ----
+    /// Apply one validated camera command to the live camera object.
+    pub camera_apply: Option<CameraApplyFn>,
+    /// Return and clear wheel notches observed by the host window procedure.
+    pub camera_wheel_delta: Option<CameraWheelFn>,
+    /// Claim the native camera input boundary while non-zero.
+    pub camera_input_capture: Option<unsafe extern "system" fn(i32) -> i32>,
 }
