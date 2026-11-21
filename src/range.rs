@@ -53,6 +53,35 @@ struct DepthSample {
     eye: CokeRangePoint,
     ray: CokeRangePoint,
     projection: [f32; 16],
+    pixel_x: i32,
+    pixel_y: i32,
+    issued_at: u32,
+}
+
+#[derive(Clone, Copy)]
+struct DepthHit {
+    point: Option<CokeRangePoint>,
+    pixel_x: i32,
+    pixel_y: i32,
+    issued_at: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CursorHit {
+    point: CokeRangePoint,
+    depth: Option<DepthHit>,
+}
+
+impl CursorHit {
+    fn depth_sampled_here_since(self, cursor: Point, since: u32) -> bool {
+        let Some(depth) = self.depth else {
+            return false;
+        };
+        let cursor_y = PHYS_H.load(Ordering::Relaxed) - cursor.y - 1;
+        depth.issued_at.wrapping_sub(since) < 0x8000_0000
+            && (depth.pixel_x - cursor.x).abs() <= 3
+            && (depth.pixel_y - cursor_y).abs() <= 3
+    }
 }
 
 struct DepthReadback {
@@ -61,7 +90,7 @@ struct DepthReadback {
     fences: [usize; 2],
     samples: [Option<DepthSample>; 2],
     next: usize,
-    last_hit: Option<CokeRangePoint>,
+    last_hit: Option<DepthHit>,
     disabled: bool,
 }
 
@@ -100,7 +129,7 @@ struct Scene {
 
 #[derive(Clone, Copy)]
 enum Origin {
-    Cursor,
+    Cursor { since: u32 },
     Point(CokeRangePoint),
 }
 
@@ -110,7 +139,7 @@ struct State {
     can_start: bool,
     unit_selected: bool,
     source_height: f32,
-    cursor_sample: Option<(u32, CokeRangePoint)>,
+    cursor_sample: Option<(u32, CursorHit)>,
     pending: Option<Origin>,
     origin: Option<CokeRangePoint>,
     result: Option<CokeRangeResult>,
@@ -165,6 +194,16 @@ fn cursor_sample_interval() -> u32 {
     CURSOR_SAMPLE_INTERVAL_MS
 }
 
+fn depth_pick_supported() -> bool {
+    if !DEPTH_API.get().is_some_and(Option::is_some) {
+        return false;
+    }
+    DEPTH_READBACK
+        .get()
+        .and_then(|readback| readback.try_lock().ok())
+        .is_none_or(|state| !state.disabled)
+}
+
 fn in_terrain(p: CokeRangePoint, t: &Terrain) -> bool {
     finite(p) && p.x >= 0.0 && p.y >= 0.0 && p.x < t.world_w && p.y < t.world_h
 }
@@ -209,7 +248,9 @@ pub unsafe extern "system" fn control(action: u32, point: *const CokeRangePoint)
         return 0;
     }
     let origin = if action == RANGE_FROM_CURSOR {
-        Origin::Cursor
+        Origin::Cursor {
+            since: unsafe { GetTickCount() },
+        }
     } else {
         if point.is_null() || !point.is_aligned() {
             return 0;
@@ -285,7 +326,9 @@ pub fn handle_message(msg: u32, value: usize, flags: isize) -> bool {
         if state.active() {
             state.cancel();
         } else {
-            state.start(Origin::Cursor);
+            state.start(Origin::Cursor {
+                since: unsafe { GetTickCount() },
+            });
         }
     }
     true
@@ -471,7 +514,7 @@ unsafe fn draw_label(native: Native, view: usize, result: CokeRangeResult) {
                 width / 2,
                 height - 36,
                 font_height,
-                "Aim at ground",
+                "Aim at surface",
             )
         };
         return;
@@ -534,11 +577,7 @@ unsafe fn print_label(native: Native, font: u32, x: i32, y: i32, font_height: u3
     }
 }
 
-unsafe fn cursor(
-    terrain: &Terrain,
-    state: &mut State,
-    now: u32,
-) -> Option<(CokeRangePoint, Point, Option<CokeRangePoint>)> {
+unsafe fn cursor(terrain: &Terrain, state: &mut State, now: u32) -> Option<(CursorHit, Point)> {
     let hwnd = MAIN_WINDOW.load(Ordering::Relaxed) as Hwnd;
     let get = REAL_GET_CURSOR_POS.load(Ordering::Relaxed);
     if hwnd.is_null() || get == 0 {
@@ -560,17 +599,15 @@ unsafe fn cursor(
     {
         hit
     } else {
-        let hit = unsafe { depth_surface(terrain, pos.x, pos.y, eye, ray, &projection) }
+        let depth = unsafe { depth_surface(terrain, pos.x, pos.y, eye, ray, &projection, now) };
+        let point = depth
+            .and_then(|hit| hit.point)
             .or_else(|| unsafe { trace_ground(terrain, eye, ray) })?;
+        let hit = CursorHit { point, depth };
         state.cursor_sample = Some((now, hit));
         hit
     };
-    let ground_origin = if matches!(state.pending, Some(Origin::Cursor)) {
-        unsafe { trace_ground(terrain, eye, ray) }.filter(|point| in_terrain(*point, terrain))
-    } else {
-        None
-    };
-    Some((hit, pos, ground_origin))
+    Some((hit, pos))
 }
 
 unsafe fn battle_cursor_ray(x: i32, y: i32) -> Option<(CokeRangePoint, CokeRangePoint, [f32; 16])> {
@@ -616,7 +653,8 @@ unsafe fn depth_surface(
     eye: CokeRangePoint,
     ray: CokeRangePoint,
     projection: &[f32; 16],
-) -> Option<CokeRangePoint> {
+    now: u32,
+) -> Option<DepthHit> {
     let api = DEPTH_API
         .get_or_init(|| unsafe { load_depth_api() })
         .as_ref()
@@ -645,6 +683,9 @@ unsafe fn depth_surface(
         eye,
         ray,
         projection: *projection,
+        pixel_x: x,
+        pixel_y,
+        issued_at: now,
     };
     let lock = DEPTH_READBACK.get_or_init(|| Mutex::new(DepthReadback::new()));
     let Ok(mut readback) = lock.try_lock() else {
@@ -720,7 +761,12 @@ unsafe fn depth_surface(
         };
         unsafe { bind(0x88eb, previous as u32) };
         if let Some(sample) = sample {
-            readback.last_hit = depth.and_then(|depth| depth_point(terrain, sample, depth));
+            readback.last_hit = Some(DepthHit {
+                point: depth.and_then(|depth| depth_point(terrain, sample, depth)),
+                pixel_x: sample.pixel_x,
+                pixel_y: sample.pixel_y,
+                issued_at: sample.issued_at,
+            });
         }
     }
 
@@ -927,14 +973,21 @@ unsafe fn update(native: Native) {
         return;
     }
     state.result = None;
-    let Some((target, pixel, ground_origin)) =
-        (unsafe { cursor(&terrain, &mut state, now) }).filter(|(p, _, _)| in_terrain(*p, &terrain))
+    let Some((cursor_hit, pixel)) = (unsafe { cursor(&terrain, &mut state, now) })
+        .filter(|(hit, _)| in_terrain(hit.point, &terrain))
     else {
         return;
     };
+    if let Some(Origin::Cursor { since }) = state.pending
+        && depth_pick_supported()
+        && !cursor_hit.depth_sampled_here_since(pixel, since)
+    {
+        return;
+    }
+    let target = cursor_hit.point;
     if let Some(origin) = state.pending.take() {
         state.origin = match origin {
-            Origin::Cursor => ground_origin.or(Some(target)),
+            Origin::Cursor { .. } => Some(target),
             Origin::Point(point) => Some(point).filter(|&p| in_terrain(p, &terrain)),
         };
     }
