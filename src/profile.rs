@@ -152,6 +152,21 @@ impl Los {
     }
 }
 
+/// Native range preview addresses on a matched engine image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RangePreview {
+    pub draw_call: u32,
+    pub draw_flush: u32,
+    pub trace: u32,
+    pub ribbon: u32,
+    pub point_vtable: u32,
+    pub hud_call: u32,
+    pub hud_draw: u32,
+    pub label_draw: u32,
+    pub label_width: u32,
+    pub label_background: u32,
+}
+
 /// One build of one executable.
 #[derive(Clone, Debug)]
 pub struct Profile {
@@ -169,6 +184,7 @@ pub struct Profile {
     /// Class name -> vtable RVA. Names keep their original case.
     pub rtti: Vec<(String, u32)>,
     pub los: Option<Los>,
+    pub range: Option<RangePreview>,
     /// Where this profile came from, for the selection log line.
     pub source: String,
 }
@@ -198,6 +214,9 @@ impl Profile {
         }
         if self.los.is_some() {
             v.push("los");
+        }
+        if self.range.is_some() {
+            v.push("range");
         }
         if v.is_empty() {
             "none".to_string()
@@ -310,6 +329,7 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
         scene: None,
         rtti: Vec::new(),
         los: None,
+        range: None,
         source: source.to_string(),
     };
     let mut section = String::new();
@@ -351,6 +371,9 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
                 "canvas" => have_canvas = true,
                 "scene" => have_scene = true,
                 "los" => have_los = true,
+                "range" => {
+                    p.range.get_or_insert_with(RangePreview::default);
+                }
                 "profile" | "slots" | "rtti" => {}
                 other => unknown.push(format!("section [{other}]")),
             }
@@ -424,6 +447,23 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
             "rtti" => {
                 let v = num(value)?;
                 p.rtti.push((key.to_string(), v));
+            }
+            "range" => {
+                let r = p.range.get_or_insert_with(RangePreview::default);
+                let v = num(value)?;
+                match key.to_ascii_lowercase().as_str() {
+                    "draw_call" => r.draw_call = v,
+                    "draw_flush" => r.draw_flush = v,
+                    "trace" => r.trace = v,
+                    "ribbon" => r.ribbon = v,
+                    "point_vtable" => r.point_vtable = v,
+                    "hud_call" => r.hud_call = v,
+                    "hud_draw" => r.hud_draw = v,
+                    "label_draw" => r.label_draw = v,
+                    "label_width" => r.label_width = v,
+                    "label_background" => r.label_background = v,
+                    _ => unknown.push(format!("{section}.{key}")),
+                }
             }
             "los" => {
                 if key.eq_ignore_ascii_case("map_globals") {
@@ -576,6 +616,31 @@ pub fn validate_addresses(p: &Profile) -> Result<(), String> {
         }
         for g in &l.map_globals {
             check("los.map_globals", *g)?;
+        }
+    }
+    if let Some(r) = p.range {
+        if p.text_fnv1a.is_none()
+            || p.los.is_none()
+            || p.scene.as_ref().is_none_or(|s| s.owner_ptr == 0)
+        {
+            return Err("[range] requires a text hash, [scene] owner_ptr and [los]".to_string());
+        }
+        for (what, rva) in [
+            ("draw_call", r.draw_call),
+            ("draw_flush", r.draw_flush),
+            ("trace", r.trace),
+            ("ribbon", r.ribbon),
+            ("point_vtable", r.point_vtable),
+            ("hud_call", r.hud_call),
+            ("hud_draw", r.hud_draw),
+            ("label_draw", r.label_draw),
+            ("label_width", r.label_width),
+            ("label_background", r.label_background),
+        ] {
+            if rva == 0 {
+                return Err(format!("[range] missing {what}"));
+            }
+            check(&format!("range.{what}"), rva)?;
         }
     }
     Ok(())
@@ -763,6 +828,7 @@ fn same_facts(a: &Profile, b: &Profile) -> bool {
         && a.scene == b.scene
         && a.rtti == b.rtti
         && a.los == b.los
+        && a.range == b.range
 }
 
 /// Outcome of profile selection.

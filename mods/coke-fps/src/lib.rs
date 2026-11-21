@@ -13,22 +13,20 @@
 #![allow(clippy::missing_safety_doc, clippy::type_complexity)]
 
 use coke_host::CokeHost;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::ffi::CString;
 
 const VK_F10: i32 = 0x79;
 
-static HOST: AtomicUsize = AtomicUsize::new(0);
+static HOST: std::sync::OnceLock<CokeHost> = std::sync::OnceLock::new();
 static HUD_MODE: AtomicU32 = AtomicU32::new(0);
 static VISIBLE: AtomicU32 = AtomicU32::new(1);
 
 unsafe fn log(msg: &str) {
     unsafe {
-        let ptr = HOST.load(Ordering::Relaxed);
-        if ptr == 0 {
+        let Some(host) = HOST.get() else {
             return;
-        }
-        let host = &*(ptr as *const CokeHost);
+        };
         if let Some(log) = host.log
             && let Ok(text) = CString::new(msg)
         {
@@ -50,14 +48,10 @@ unsafe extern "system" fn toggle() {
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
     unsafe {
-        if host.is_null() {
+        let Some(h) = CokeHost::copy_from_raw(host) else {
             return 0;
-        }
-        let h = &*host;
-        if h.api_version < 1 {
-            return 0;
-        }
-        HOST.store(host as usize, Ordering::Relaxed);
+        };
+        let _ = HOST.set(h);
         // API v3+ calls `coke_hud` after every mod's world-space pass. Defer the
         // text there so a world overlay (cokelos) cannot cover it.
         HUD_MODE.store(u32::from(h.api_version >= 3), Ordering::Relaxed);
@@ -87,11 +81,9 @@ unsafe fn draw_fps(fps: f32) {
         if VISIBLE.load(Ordering::Relaxed) == 0 {
             return;
         }
-        let host_ptr = HOST.load(Ordering::Relaxed);
-        if host_ptr == 0 {
+        let Some(host) = HOST.get() else {
             return;
-        }
-        let host = &*(host_ptr as *const CokeHost);
+        };
         let Some(draw_text) = host.draw_text else {
             return;
         };

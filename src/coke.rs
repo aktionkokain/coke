@@ -573,6 +573,8 @@ static COKE_HOST: CokeHost = CokeHost {
     camera_apply: Some(host_camera_apply),
     camera_wheel_delta: Some(host_camera_wheel_delta),
     camera_input_capture: Some(host_camera_input_capture),
+    range_control: Some(crate::range::control),
+    range_read: Some(crate::range::read),
 };
 
 type CokeFrameFn = unsafe extern "system" fn(i32, i32, f32);
@@ -901,7 +903,28 @@ mod tests {
     }
 
     #[test]
-    fn host_api_reports_v6() {
-        assert_eq!(COKE_HOST.api_version, 6);
+    fn legacy_host_copy_exposes_only_the_advertised_prefix() {
+        assert_eq!(coke_host::COKE_HOST_V6_SIZE, 144);
+        let mut source = COKE_HOST;
+        source.api_version = 6;
+        source.size = coke_host::COKE_HOST_V6_SIZE as u32;
+        let mut prefix = [0usize; coke_host::COKE_HOST_V6_SIZE / core::mem::size_of::<usize>()];
+        let copied = unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&source as *const CokeHost).cast::<u8>(),
+                prefix.as_mut_ptr().cast::<u8>(),
+                coke_host::COKE_HOST_V6_SIZE,
+            );
+            CokeHost::copy_from_raw(prefix.as_ptr().cast())
+        }
+        .unwrap();
+        assert!(copied.camera_apply.is_some());
+        assert!(copied.range_control.is_none());
+        assert!(copied.range_read.is_none());
+    }
+
+    #[test]
+    fn host_api_reports_v7() {
+        assert_eq!(COKE_HOST.api_version, 7);
     }
 }

@@ -533,17 +533,17 @@ unsafe fn tick() {
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
     unsafe {
-        if host.is_null() || (*host).api_version < 6 {
+        let Some(copy) = CokeHost::copy_from_raw(host) else {
+            return 0;
+        };
+        if copy.api_version < 6 || (copy.size as usize) < coke_host::COKE_HOST_V6_SIZE {
             return 0;
         }
-        if ((*host).size as usize) < core::mem::size_of::<CokeHost>() {
-            return 0;
-        }
-        let _ = HOST.set(*host);
+        let _ = HOST.set(copy);
         let _ = CFG.set(load_config());
         let cfg = *CFG.get().expect("camera config initialized");
         let vk = VK_F1 + cfg.freecam_fkey as i32 - 1;
-        let registered = (*host)
+        let registered = copy
             .register_hotkey
             .is_some_and(|register| register(vk, Some(toggle_freecam)) != 0);
         if registered {

@@ -166,6 +166,7 @@ pub const VK_RBUTTON: i32 = 0x02;
 pub const WM_ENTERSIZEMOVE: u32 = 0x0231;
 pub const WM_EXITSIZEMOVE: u32 = 0x0232;
 pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_CHAR: u32 = 0x0102;
 pub const WM_SYSCOMMAND: u32 = 0x0112;
 pub const WM_NCHITTEST: u32 = 0x0084;
 pub const WM_SETCURSOR: u32 = 0x0020;
@@ -288,6 +289,7 @@ unsafe extern "system" {
     pub fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
     pub fn ClientToScreen(hwnd: Hwnd, pt: *mut Point) -> i32;
     pub fn GetAsyncKeyState(key: i32) -> i16;
+    pub fn GetKeyState(key: i32) -> i16;
     pub fn FindWindowA(class: *const c_char, title: *const c_char) -> Hwnd;
     pub fn GetClassNameA(hwnd: Hwnd, buf: *mut c_char, len: i32) -> i32;
     pub fn GetSystemMetrics(index: i32) -> i32;
@@ -470,6 +472,7 @@ unsafe extern "system" {
     pub fn DisableThreadLibraryCalls(module: Hmodule) -> i32;
     pub fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     pub fn VirtualProtect(addr: *mut c_void, size: usize, new: u32, old: *mut u32) -> i32;
+    pub fn FlushInstructionCache(process: Handle, address: *const c_void, size: usize) -> i32;
     pub fn VirtualQuery(addr: *const c_void, info: *mut MemBasicInfo, len: usize) -> usize;
     /// Fault-safe memory read: returns 0 instead of raising an exception when
     /// any page in the range is inaccessible. Used by the heap scan so a

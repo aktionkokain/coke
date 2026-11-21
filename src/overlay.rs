@@ -1244,6 +1244,7 @@ unsafe fn draw_screen_quads(screen: &[ScreenVertex], pw: i32, ph: i32) {
 }
 
 pub static REAL_GL_GET_BOOLEANV: AtomicUsize = AtomicUsize::new(0);
+pub static REAL_GL_GET_FLOATV: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_GET_INTEGERV: AtomicUsize = AtomicUsize::new(0);
 
 /// Cached FPS overlay pixel buffer. Regenerated only when fps10 changes.

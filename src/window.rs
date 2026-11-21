@@ -669,6 +669,9 @@ pub unsafe extern "system" fn custom_wndproc(
             }
         };
 
+        if crate::range::handle_message(msg, wparam, lparam) {
+            return 0;
+        }
         match msg {
             WM_CLOSE => {
                 if config().forced_exit {
@@ -792,7 +795,7 @@ pub unsafe extern "system" fn custom_wndproc(
                     CAMERA_RMB_MESSAGE_DOWN.store(1, Ordering::Release);
                     CAMERA_RMB_DRAG_CANCELLED.store(0, Ordering::Release);
                     CAMERA_RMB_DOWN_POINT.store(transform_client_lparam(lparam), Ordering::Release);
-                    CAMERA_RMB_DOWN_WPARAM.store(wparam as usize, Ordering::Release);
+                    CAMERA_RMB_DOWN_WPARAM.store(wparam, Ordering::Release);
                     CAMERA_RMB_DOWN_MESSAGE.store(msg, Ordering::Release);
                     // Delay native right-click delivery until release. If this
                     // becomes a drag, the engine never enters its origin-based
@@ -828,7 +831,7 @@ pub unsafe extern "system" fn custom_wndproc(
                     CAMERA_RMB_MESSAGE_DOWN.store(0, Ordering::Release);
                     CAMERA_RMB_DRAG_CANCELLED.store(0, Ordering::Release);
                     let down_message = CAMERA_RMB_DOWN_MESSAGE.swap(0, Ordering::AcqRel);
-                    let down_wparam = CAMERA_RMB_DOWN_WPARAM.swap(0, Ordering::AcqRel) as usize;
+                    let down_wparam = CAMERA_RMB_DOWN_WPARAM.swap(0, Ordering::AcqRel);
                     let down_lparam = CAMERA_RMB_DOWN_POINT.swap(0, Ordering::AcqRel);
                     let up_lparam = transform_client_lparam(lparam);
                     if cancelled {

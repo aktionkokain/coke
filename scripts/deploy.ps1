@@ -109,6 +109,7 @@ if ($WithMods) {
         $mods += @(
             @{ Dir = "coke-fps"; Dll = "coke_fps.dll"; Ini = $null },
             @{ Dir = "coke-los"; Dll = "cokelos.dll"; Ini = "cokelos.ini" },
+            @{ Dir = "coke-range"; Dll = "coke_range.dll"; Ini = $null },
             @{ Dir = "coke-prof"; Dll = "coke_prof.dll"; Ini = "coke-prof.ini" },
             @{ Dir = "coke-camera"; Dll = "coke_camera.dll"; Ini = "coke-camera.ini" }
         )

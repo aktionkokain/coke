@@ -35,6 +35,7 @@ mod opengl;
 mod overlay;
 mod perf;
 mod profile;
+mod range;
 mod rtti;
 mod state;
 mod tuning;

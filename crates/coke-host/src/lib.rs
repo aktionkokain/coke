@@ -13,19 +13,20 @@
 use core::ffi::c_char;
 
 /// Current host API version. Bumped whenever the table grows.
-pub const COKE_HOST_API: u32 = 6;
+pub const COKE_HOST_API: u32 = 7;
 
 /// Size of the API v2.1 prefix (everything up to and including `los_scan_map`).
 ///
 /// Mods that support older proxies compare the host-reported `size` against
 /// this instead of `size_of::<CokeHost>()`, so they keep working with a host
 /// that does not provide the v4 or v5 tail.
-pub const COKE_HOST_V2_1_SIZE: usize =
-    core::mem::size_of::<CokeHost>() - 5 * core::mem::size_of::<usize>();
+pub const COKE_HOST_V2_1_SIZE: usize = core::mem::offset_of!(CokeHost, register_hotkey);
 
 /// Size through the v4 tail, excluding the v5 camera extensions.
-pub const COKE_HOST_V4_SIZE: usize =
-    core::mem::size_of::<CokeHost>() - 3 * core::mem::size_of::<usize>();
+pub const COKE_HOST_V4_SIZE: usize = core::mem::offset_of!(CokeHost, camera_apply);
+
+/// Size through the v6 camera controls.
+pub const COKE_HOST_V6_SIZE: usize = core::mem::offset_of!(CokeHost, range_control);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -114,6 +115,41 @@ pub type RegisterHotkeyFn =
 pub type CameraApplyFn = unsafe extern "system" fn(*const CokeCameraCommand) -> i32;
 pub type CameraWheelFn = unsafe extern "system" fn() -> f32;
 
+/// Range preview actions accepted by `range_control`.
+pub const RANGE_ENABLE_KEYS: u32 = 1;
+pub const RANGE_FROM_CURSOR: u32 = 2;
+pub const RANGE_SET_ORIGIN: u32 = 3;
+pub const RANGE_CANCEL: u32 = 4;
+
+/// Range preview status values returned in `CokeRangeResult::status`.
+pub const RANGE_WAITING: u32 = 1;
+pub const RANGE_CLEAR: u32 = 2;
+pub const RANGE_BLOCKED: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CokeRangePoint {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CokeRangeResult {
+    pub status: u32,
+    pub origin: CokeRangePoint,
+    pub target: CokeRangePoint,
+    pub distance_m: f32,
+    pub visible_fraction: f32,
+    /// Cursor in physical client pixels, with a top-left origin.
+    pub cursor_x: i32,
+    pub cursor_y: i32,
+}
+
+pub type RangeControlFn = unsafe extern "system" fn(u32, *const CokeRangePoint) -> i32;
+pub type RangeReadFn = unsafe extern "system" fn(*mut CokeRangeResult) -> i32;
+
 /// Host services exposed to a `coke` mod. `#[repr(C)]` so a C or Rust DLL can
 /// use the same layout. See the module docs for the append-only rule.
 #[repr(C)]
@@ -178,4 +214,50 @@ pub struct CokeHost {
     pub camera_wheel_delta: Option<CameraWheelFn>,
     /// Claim the native camera input boundary while non-zero.
     pub camera_input_capture: Option<unsafe extern "system" fn(i32) -> i32>,
+
+    // ---- v7 (appended) ----
+    /// Control the shared native range preview. A return of 1 accepts the request.
+    /// RANGE_SET_ORIGIN takes a ground point in world metres, x east, y north, z up.
+    /// Other actions ignore the pointer. Commands may be submitted from any phase.
+    pub range_control: Option<RangeControlFn>,
+    /// Copy the latest active preview for the caller. A return of 0 means idle,
+    /// unsupported or no current scene. Callable from any phase.
+    pub range_read: Option<RangeReadFn>,
+}
+
+impl CokeHost {
+    /// Copy the advertised host prefix and leave any missing function pointers null.
+    ///
+    /// # Safety
+    /// The pointer must come from `coke_init` and must be readable through the
+    /// v1 prefix. Hosts at v2 and above must provide the size field and the
+    /// advertised number of initialized bytes.
+    pub unsafe fn copy_from_raw(host: *const Self) -> Option<Self> {
+        if host.is_null() || !host.is_aligned() {
+            return None;
+        }
+        let version = unsafe { core::ptr::addr_of!((*host).api_version).read() };
+        let v1_size = core::mem::offset_of!(Self, size);
+        let bytes = match version {
+            0 => return None,
+            1 => v1_size,
+            _ => {
+                let advertised = unsafe { core::ptr::addr_of!((*host).size).read() } as usize;
+                if advertised < v1_size + core::mem::size_of::<u32>() {
+                    return None;
+                }
+                advertised.min(core::mem::size_of::<Self>()) / core::mem::size_of::<usize>()
+                    * core::mem::size_of::<usize>()
+            }
+        };
+        let mut copy: Self = unsafe { core::mem::zeroed() };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                host.cast::<u8>(),
+                (&mut copy as *mut Self).cast::<u8>(),
+                bytes,
+            )
+        };
+        Some(copy)
+    }
 }

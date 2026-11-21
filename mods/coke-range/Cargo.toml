@@ -1,0 +1,15 @@
+[package]
+name = "coke-range"
+version = "0.1.0"
+edition = "2024"
+description = "Native Combat Mission ground range and visibility preview"
+
+[lib]
+name = "coke_range"
+crate-type = ["cdylib"]
+
+[dependencies]
+coke-host = { path = "../../crates/coke-host" }
+
+[profile.release]
+panic = "abort"

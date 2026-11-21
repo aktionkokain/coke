@@ -277,6 +277,8 @@ pub unsafe fn init(instance: Hmodule) {
                 // GetProcAddress like every other forwarded function.
                 REAL_GL_GET_BOOLEANV
                     .store(resolve(module, "glGetBooleanv") as usize, Ordering::Relaxed);
+                REAL_GL_GET_FLOATV
+                    .store(resolve(module, "glGetFloatv") as usize, Ordering::Relaxed);
                 REAL_GL_GET_INTEGERV
                     .store(resolve(module, "glGetIntegerv") as usize, Ordering::Relaxed);
                 // Triangle overlay (cokelos and future mods).

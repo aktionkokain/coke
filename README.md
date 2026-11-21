@@ -80,6 +80,7 @@ Or donate for a profile: [Donate](docs/DONATIONS.md)
 | coke-fps | aktion | FPS meter |
 | coke-prof | aktion | Profiler and log dumper |
 | cokelos | aktion | LOS visualizer |
+| [CokeRange](mods/coke-range/README.md) | | Native ground-to-ground range preview for Black Sea Steam x86 |
 | coke_camera (Coke Shot) | aktion | RTS-like and free camera |
 The default mods are built into [`dist/mods/`](dist/mods) with their consent
 files. Copy that folder's contents into the game's `coke\` folder to enable

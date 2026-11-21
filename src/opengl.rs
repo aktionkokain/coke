@@ -930,6 +930,7 @@ pub extern "system" fn wglGetProcAddress(name: *const c_char) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn wglSwapBuffers(hdc: Hdc) -> i32 {
+    unsafe { crate::range::install_from_swap() };
     let perf_entry = unsafe { perf::frame_begin() };
     let f: unsafe extern "system" fn(Hdc) -> i32 =
         unsafe { core::mem::transmute(REAL_WGL_SWAP_BUFFERS.load(Ordering::Relaxed)) };

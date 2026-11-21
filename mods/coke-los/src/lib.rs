@@ -718,27 +718,13 @@ fn push_lane(
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
     unsafe {
-        if host.is_null() {
+        let Some(h) = CokeHost::copy_from_raw(host) else {
+            return 0;
+        };
+        if h.api_version < 2 || (h.size as usize) < COKE_HOST_V2_1_SIZE {
             return 0;
         }
-        let h = &*host;
-        if h.api_version < 2 {
-            return 0;
-        }
-        if (h.size as usize) < COKE_HOST_V2_1_SIZE {
-            return 0;
-        }
-        // A v2/v3 host passes a smaller table than the current v4 struct. Copy
-        // only the bytes it provides so the v4 tail stays null instead of
-        // reading past the host's allocation.
-        let mut host_copy: CokeHost = core::mem::zeroed();
-        let n = (h.size as usize).min(core::mem::size_of::<CokeHost>());
-        core::ptr::copy_nonoverlapping(
-            host as *const u8,
-            &mut host_copy as *mut CokeHost as *mut u8,
-            n,
-        );
-        if HOST.set(host_copy).is_err() {
+        if HOST.set(h).is_err() {
             return 1;
         }
         HUD_MODE.store(u32::from(h.api_version >= 3), Ordering::Relaxed);

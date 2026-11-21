@@ -14,6 +14,7 @@ function Get-CokeMods {
     @(
         [pscustomobject]@{ Name = "coke-fps";  Stem = "coke_fps";  Config = $null }
         [pscustomobject]@{ Name = "coke-los";  Stem = "cokelos";   Config = "cokelos.ini" }
+        [pscustomobject]@{ Name = "coke-range"; Stem = "coke_range"; Config = $null }
         [pscustomobject]@{ Name = "coke-prof"; Stem = "coke_prof"; Config = "coke-prof.ini" }
         [pscustomobject]@{ Name = "coke-camera"; Stem = "coke_camera"; Config = "coke-camera.ini" }
     )

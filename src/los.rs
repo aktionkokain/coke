@@ -982,15 +982,15 @@ pub unsafe fn camera_apply_command(cmd: &coke_host::CokeCameraCommand) -> bool {
         cam.pos.x += right.x * cmd.pan_right + fwd.x * cmd.pan_forward;
         cam.pos.y += right.y * cmd.pan_right + fwd.y * cmd.pan_forward;
         cam.pos.z += cmd.zoom;
-        if let Some(t) = terrain() {
-            if !(camera_freecam_active() && camera_freecam_noclip()) {
-                cam.pos.x = cam.pos.x.clamp(0.0, t.world_w);
-                cam.pos.y = cam.pos.y.clamp(0.0, t.world_h);
-                cam.pos.z = cam
-                    .pos
-                    .z
-                    .max(terrain_height(&t, cam.pos.x, cam.pos.y) + 1.0);
-            }
+        if let Some(t) = terrain()
+            && !(camera_freecam_active() && camera_freecam_noclip())
+        {
+            cam.pos.x = cam.pos.x.clamp(0.0, t.world_w);
+            cam.pos.y = cam.pos.y.clamp(0.0, t.world_h);
+            cam.pos.z = cam
+                .pos
+                .z
+                .max(terrain_height(&t, cam.pos.x, cam.pos.y) + 1.0);
         }
         if guarded_height.is_some()
             && let Ok(mut last) = LAST_CAMERA_HEIGHT.lock()
