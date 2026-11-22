@@ -17,68 +17,90 @@
 
 use crate::*;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::cell::RefCell;
 use std::ffi::{CStr, c_char};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 static CAMERA_WHEEL_NOTCHES: AtomicI32 = AtomicI32::new(0);
-const MAX_MOD_BUFFER: usize = 4 * 1024 * 1024;
+const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOS_ELEMENTS: usize = 4_000_000;
+const MAX_DRAW_ELEMENTS: usize = 1_000_000;
 
-/// Validate a native mod's output buffer before turning it into a Rust slice.
-/// The ABI is intentionally unsafe, but a bad plugin must not make slice
-/// construction itself invoke undefined behavior.
-unsafe fn valid_mod_buffer(
-    ptr: *const c_void,
-    len: usize,
+/// Native callers own allocation, lifetime and exclusive access to outputs.
+pub(crate) unsafe fn mod_span<T>(
+    ptr: *const T,
+    count: usize,
     writable: bool,
-    alignment: usize,
-) -> bool {
+) -> Option<Range<usize>> {
+    let len = count.checked_mul(size_of::<T>())?;
+    let start = ptr as usize;
+    let end = start.checked_add(len)?;
+    if ptr.is_null() || len == 0 || len > isize::MAX as usize || !ptr.is_aligned() {
+        return None;
+    }
     unsafe {
-        if ptr.is_null() || len == 0 || len > MAX_MOD_BUFFER {
-            return false;
-        }
-        let start = ptr as usize;
-        if !start.is_multiple_of(alignment) {
-            return false;
-        }
-        let Some(end) = start.checked_add(len) else {
-            return false;
-        };
         let mut cursor = start;
+        let mut allocation = None;
         while cursor < end {
             let mut info: MemBasicInfo = core::mem::zeroed();
             if VirtualQuery(
                 cursor as *const c_void,
                 &mut info,
-                core::mem::size_of::<MemBasicInfo>(),
+                size_of::<MemBasicInfo>(),
             ) == 0
                 || info.state != MEM_COMMIT
-                || info.protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+                || info.protect & PAGE_GUARD != 0
+                || *allocation.get_or_insert(info.allocation_base) != info.allocation_base
             {
-                return false;
+                return None;
             }
-            if writable
-                && !matches!(
-                    info.protect & 0xff,
-                    PAGE_READWRITE
-                        | PAGE_WRITECOPY
-                        | PAGE_EXECUTE_READWRITE
-                        | PAGE_EXECUTE_WRITECOPY
-                )
+            let access = info.protect & 0xff;
+            if !(matches!(access, 0x04 | 0x08 | 0x40 | 0x80)
+                || !writable && matches!(access, 0x02 | 0x20))
             {
-                return false;
+                return None;
             }
-            let Some(region_end) = (info.base_address as usize).checked_add(info.region_size)
-            else {
-                return false;
-            };
-            if region_end <= cursor {
-                return false;
+            let next = (info.base_address as usize).checked_add(info.region_size)?;
+            if next <= cursor {
+                return None;
             }
-            cursor = region_end.min(end);
+            cursor = next;
         }
-        true
+    }
+    Some(start..end)
+}
+
+fn separate_outputs<const N: usize>(outputs: [Option<Range<usize>>; N]) -> bool {
+    outputs.iter().enumerate().all(|(index, output)| {
+        output.as_ref().is_some_and(|output| {
+            outputs[..index]
+                .iter()
+                .flatten()
+                .all(|other| output.end <= other.start || other.end <= output.start)
+        })
+    })
+}
+
+unsafe fn los_outputs(
+    vis: *mut u8,
+    vis_len: u32,
+    heights: *mut f32,
+    heights_len: u32,
+    nx: *mut i32,
+    nz: *mut i32,
+) -> bool {
+    unsafe {
+        vis_len as usize <= MAX_LOS_ELEMENTS
+            && heights_len as usize <= MAX_LOS_ELEMENTS
+            && separate_outputs([
+                mod_span(vis, vis_len as usize, true),
+                mod_span(heights, heights_len as usize, true),
+                mod_span(nx, 1, true),
+                mod_span(nz, 1, true),
+            ])
     }
 }
 
@@ -100,6 +122,9 @@ unsafe extern "system" fn host_log(msg: *const c_char) {
 }
 
 unsafe extern "system" fn host_draw_text(x: i32, y: i32, text: *const c_char, rgb: u32) {
+    if !IN_RENDER_CALLBACK.get() {
+        return;
+    }
     unsafe {
         if text.is_null() {
             return;
@@ -136,9 +161,7 @@ unsafe extern "system" fn host_read_f32(addr: u32) -> f32 {
 
 unsafe extern "system" fn host_read_bytes(addr: u32, out: *mut u8, len: u32) -> i32 {
     unsafe {
-        if !valid_mod_buffer(out.cast(), len as usize, true, core::mem::align_of::<u8>())
-            || len > 16 * 1024 * 1024
-        {
+        if len as usize > MAX_READ_BYTES || mod_span(out, len as usize, true).is_none() {
             return 0;
         }
         let buf = core::slice::from_raw_parts_mut(out, len as usize);
@@ -171,6 +194,9 @@ unsafe extern "system" fn host_class_name(vt: u32, out: *mut c_char, len: u32) -
         };
         let bytes = name.as_bytes();
         let n = bytes.len().min(len as usize - 1);
+        if mod_span(out, n + 1, true).is_none() {
+            return 0;
+        }
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n);
         *out.add(n) = 0;
         n as i32
@@ -179,7 +205,7 @@ unsafe extern "system" fn host_class_name(vt: u32, out: *mut c_char, len: u32) -
 
 unsafe extern "system" fn host_scene_rect(out: *mut i32) -> i32 {
     unsafe {
-        if out.is_null() {
+        if mod_span(out, 4, true).is_none() {
             return 0;
         }
         match scene_rect() {
@@ -194,7 +220,7 @@ unsafe extern "system" fn host_scene_rect(out: *mut i32) -> i32 {
 
 unsafe extern "system" fn host_camera(out: *mut CokeCamera) -> i32 {
     unsafe {
-        if out.is_null() {
+        if mod_span(out, 1, true).is_none() {
             return 0;
         }
         let Some(c) = camera() else { return 0 };
@@ -219,7 +245,7 @@ unsafe extern "system" fn host_world_to_screen(
     sy: *mut f32,
 ) -> i32 {
     unsafe {
-        if sx.is_null() || sy.is_null() {
+        if !separate_outputs([mod_span(sx, 1, true), mod_span(sy, 1, true)]) {
             return 0;
         }
         let Some(cam) = stable_camera() else { return 0 };
@@ -239,7 +265,11 @@ unsafe extern "system" fn host_world_to_screen(
 
 unsafe extern "system" fn host_cursor_world(x: *mut f32, y: *mut f32, z: *mut f32) -> i32 {
     unsafe {
-        if x.is_null() || y.is_null() || z.is_null() {
+        if !separate_outputs([
+            mod_span(x, 1, true),
+            mod_span(y, 1, true),
+            mod_span(z, 1, true),
+        ]) {
             return 0;
         }
         match cursor_world() {
@@ -256,7 +286,7 @@ unsafe extern "system" fn host_cursor_world(x: *mut f32, y: *mut f32, z: *mut f3
 
 unsafe extern "system" fn host_terrain(out: *mut CokeTerrain) -> i32 {
     unsafe {
-        if out.is_null() {
+        if mod_span(out, 1, true).is_none() {
             return 0;
         }
         let Some(t) = terrain() else { return 0 };
@@ -297,20 +327,7 @@ unsafe extern "system" fn host_los_scan(
     nz: *mut i32,
 ) -> i32 {
     unsafe {
-        if vis.is_null() || heights.is_null() || nx.is_null() || nz.is_null() {
-            return 0;
-        }
-        if !valid_mod_buffer(
-            vis.cast(),
-            vis_len as usize,
-            true,
-            core::mem::align_of::<u8>(),
-        ) || !valid_mod_buffer(
-            heights.cast(),
-            heights_len as usize,
-            true,
-            core::mem::align_of::<f32>(),
-        ) {
+        if !los_outputs(vis, vis_len, heights, heights_len, nx, nz) {
             return 0;
         }
         let v = core::slice::from_raw_parts_mut(vis, vis_len as usize);
@@ -357,7 +374,11 @@ unsafe extern "system" fn host_selected_unit() -> u32 {
 
 unsafe extern "system" fn host_unit_pos(unit: u32, x: *mut f32, y: *mut f32, z: *mut f32) -> i32 {
     unsafe {
-        if x.is_null() || y.is_null() || z.is_null() {
+        if !separate_outputs([
+            mod_span(x, 1, true),
+            mod_span(y, 1, true),
+            mod_span(z, 1, true),
+        ]) {
             return 0;
         }
         match unit_pos(unit as usize) {
@@ -373,8 +394,14 @@ unsafe extern "system" fn host_unit_pos(unit: u32, x: *mut f32, y: *mut f32, z: 
 }
 
 unsafe extern "system" fn host_draw_world_triangles(verts: *const WorldVertex, count: u32) {
+    if !IN_RENDER_CALLBACK.get() {
+        return;
+    }
     unsafe {
-        if verts.is_null() || count == 0 || count > 1_000_000 || !count.is_multiple_of(3) {
+        if count as usize > MAX_DRAW_ELEMENTS
+            || !count.is_multiple_of(3)
+            || mod_span(verts, count as usize, false).is_none()
+        {
             return;
         }
         let v = core::slice::from_raw_parts(verts, count as usize);
@@ -388,22 +415,8 @@ unsafe extern "system" fn host_key_down(vk: i32) -> i32 {
 
 unsafe extern "system" fn host_focused() -> i32 {
     unsafe {
-        // Accept any window owned by this process, not just the cached main handle.
-        // The engine destroys and recreates its window during startup, so comparing
-        // against `MAIN_WINDOW` could silently disable every mod hotkey; the process
-        // id stays the same no matter which window (or borderless mode) is active.
         let fg = GetForegroundWindow();
-        if fg.is_null() {
-            return 0;
-        }
-        if IsIconic(fg) != 0 {
-            return 0;
-        }
-        let mut pid = 0u32;
-        if GetWindowThreadProcessId(fg, &mut pid) == 0 {
-            return 0;
-        }
-        (pid == GetCurrentProcessId()) as i32
+        (current_window(fg) && IsIconic(fg) == 0) as i32
     }
 }
 
@@ -418,8 +431,14 @@ unsafe extern "system" fn host_time_ms() -> u32 {
 }
 
 unsafe extern "system" fn host_draw_world_lines(verts: *const WorldVertex, count: u32, width: f32) {
+    if !IN_RENDER_CALLBACK.get() {
+        return;
+    }
     unsafe {
-        if verts.is_null() || count < 2 || !count.is_multiple_of(2) || count > 1_000_000 {
+        if count as usize > MAX_DRAW_ELEMENTS
+            || !count.is_multiple_of(2)
+            || mod_span(verts, count as usize, false).is_none()
+        {
             return;
         }
         let v = core::slice::from_raw_parts(verts, count as usize);
@@ -441,20 +460,7 @@ unsafe extern "system" fn host_los_scan_map(
     nz: *mut i32,
 ) -> i32 {
     unsafe {
-        if vis.is_null() || heights.is_null() || nx.is_null() || nz.is_null() {
-            return 0;
-        }
-        if !valid_mod_buffer(
-            vis.cast(),
-            vis_len as usize,
-            true,
-            core::mem::align_of::<u8>(),
-        ) || !valid_mod_buffer(
-            heights.cast(),
-            heights_len as usize,
-            true,
-            core::mem::align_of::<f32>(),
-        ) {
+        if !los_outputs(vis, vis_len, heights, heights_len, nx, nz) {
             return 0;
         }
         let v = core::slice::from_raw_parts_mut(vis, vis_len as usize);
@@ -472,7 +478,11 @@ unsafe extern "system" fn host_los_scan_map(
 
 unsafe extern "system" fn host_cursor_ground(x: *mut f32, y: *mut f32, z: *mut f32) -> i32 {
     unsafe {
-        if x.is_null() || y.is_null() || z.is_null() {
+        if !separate_outputs([
+            mod_span(x, 1, true),
+            mod_span(y, 1, true),
+            mod_span(z, 1, true),
+        ]) {
             return 0;
         }
         match cursor_ground() {
@@ -487,12 +497,74 @@ unsafe extern "system" fn host_cursor_ground(x: *mut f32, y: *mut f32, z: *mut f
     }
 }
 
+const MAX_CAMERA_COMMANDS: usize = 8;
+static CAMERA_COMMANDS: Mutex<Option<CameraCommands>> = Mutex::new(None);
+
+struct CameraCommands {
+    scene: u32,
+    window: u32,
+    queued_at: u32,
+    commands: [CokeCameraCommand; MAX_CAMERA_COMMANDS],
+    len: usize,
+}
+
 unsafe extern "system" fn host_camera_apply(cmd: *const CokeCameraCommand) -> i32 {
     unsafe {
-        if cmd.is_null() {
+        if MOD_INIT.with(|init| init.borrow().is_some())
+            || !profile_ok()
+            || host_focused() == 0
+            || mod_span(cmd, 1, false).is_none()
+        {
             return 0;
         }
-        camera_apply_command(&*cmd) as i32
+        let command = cmd.read();
+        if !camera_command_valid(&command) {
+            return 0;
+        }
+        let Ok(mut queued) = CAMERA_COMMANDS.try_lock() else {
+            return 0;
+        };
+        let scene = SCENE_GENERATION.load(Ordering::Relaxed);
+        let window = WINDOW_GENERATION.load(Ordering::Acquire);
+        let now = GetTickCount();
+        if queued.as_ref().is_none_or(|batch| {
+            batch.scene != scene
+                || batch.window != window
+                || now.wrapping_sub(batch.queued_at) > 150
+        }) {
+            *queued = Some(CameraCommands {
+                scene,
+                window,
+                queued_at: now,
+                commands: [CokeCameraCommand::default(); MAX_CAMERA_COMMANDS],
+                len: 0,
+            });
+        }
+        let batch = queued.as_mut().unwrap();
+        if batch.len == batch.commands.len() {
+            return 0;
+        }
+        batch.commands[batch.len] = command;
+        batch.len += 1;
+        1
+    }
+}
+
+/// The game's presentation thread owns controller camera mutations between frames.
+pub(crate) unsafe fn apply_queued_camera(battle: bool) {
+    let pending = CAMERA_COMMANDS
+        .try_lock()
+        .ok()
+        .and_then(|mut queue| queue.take());
+    if let Some(batch) = pending
+        && battle
+        && batch.scene == SCENE_GENERATION.load(Ordering::Relaxed)
+        && batch.window == WINDOW_GENERATION.load(Ordering::Acquire)
+        && unsafe { GetTickCount().wrapping_sub(batch.queued_at) <= 150 && host_focused() != 0 }
+    {
+        for command in &batch.commands[..batch.len] {
+            unsafe { camera_apply_command(command) };
+        }
     }
 }
 
@@ -503,7 +575,13 @@ unsafe extern "system" fn host_camera_wheel_delta() -> f32 {
 unsafe extern "system" fn host_camera_input_capture(captured: i32) -> i32 {
     // Bit 0 claims native camera input; bit 1 enables free flight and R/F
     // suppression; bit 2 disables terrain clearance in free-camera mode.
-    set_camera_input_capture(captured);
+    MOD_INIT.with(|init| {
+        if let Some(init) = init.borrow_mut().as_mut() {
+            init.camera_capture = Some(captured);
+        } else {
+            set_camera_input_capture(captured);
+        }
+    });
     1
 }
 
@@ -514,26 +592,55 @@ pub fn coke_note_wheel(notches: i32) {
     CAMERA_WHEEL_NOTCHES.fetch_add(notches.clamp(-120, 120), Ordering::Relaxed);
 }
 
-/// Set while a mod's `coke_init` runs, so `set_layer` knows which mod it means.
-static INIT_ACTIVE: AtomicU32 = AtomicU32::new(0);
-static PENDING_LAYER: AtomicI32 = AtomicI32::new(0);
+#[derive(Default)]
+struct ModInit {
+    layer: i32,
+    hotkeys: Vec<(i32, hotkeys::HotkeyFn)>,
+    enable_range_keys: bool,
+    camera_capture: Option<i32>,
+}
 
-unsafe extern "system" fn host_register_hotkey(
-    vk: i32,
-    cb: Option<unsafe extern "system" fn()>,
-) -> i32 {
-    match cb {
-        Some(cb) => hotkeys::register(vk, cb) as i32,
-        None => 0,
-    }
+thread_local! {
+    static IN_RENDER_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MOD_INIT: RefCell<Option<ModInit>> = const { RefCell::new(None) };
+}
+
+unsafe extern "system" fn host_register_hotkey(vk: i32, cb: Option<hotkeys::HotkeyFn>) -> i32 {
+    MOD_INIT.with(|init| match (init.borrow_mut().as_mut(), cb) {
+        (Some(init), Some(cb)) => hotkeys::stage(&mut init.hotkeys, vk, cb) as i32,
+        _ => 0,
+    })
 }
 
 unsafe extern "system" fn host_set_layer(layer: i32) {
-    if INIT_ACTIVE.load(Ordering::Relaxed) == 0 {
-        log("coke: set_layer ignored (call it from coke_init)");
-        return;
-    }
-    PENDING_LAYER.store(layer, Ordering::Relaxed);
+    MOD_INIT.with(|init| {
+        if let Some(init) = init.borrow_mut().as_mut() {
+            init.layer = layer;
+        }
+    });
+}
+
+unsafe extern "system" fn host_range_control(
+    action: u32,
+    point: *const coke_host::CokeRangePoint,
+) -> i32 {
+    MOD_INIT.with(|init| {
+        if let Some(init) = init.borrow_mut().as_mut() {
+            if action == coke_host::RANGE_ENABLE_KEYS {
+                init.enable_range_keys = true;
+                return 1;
+            }
+            return 0;
+        }
+        unsafe { crate::range::control(action, point) }
+    })
+}
+
+fn initialize_mod(init: CokeInitFn) -> Option<ModInit> {
+    MOD_INIT.with(|pending| pending.replace(Some(ModInit::default())));
+    let accepted = unsafe { init(&COKE_HOST) } != 0;
+    let pending = MOD_INIT.with(|pending| pending.take());
+    if accepted { pending } else { None }
 }
 
 static COKE_HOST: CokeHost = CokeHost {
@@ -573,8 +680,9 @@ static COKE_HOST: CokeHost = CokeHost {
     camera_apply: Some(host_camera_apply),
     camera_wheel_delta: Some(host_camera_wheel_delta),
     camera_input_capture: Some(host_camera_input_capture),
-    range_control: Some(crate::range::control),
+    range_control: Some(host_range_control),
     range_read: Some(crate::range::read),
+    range_capabilities: Some(crate::range::capabilities),
 };
 
 type CokeFrameFn = unsafe extern "system" fn(i32, i32, f32);
@@ -586,6 +694,10 @@ struct CokeMod {
     /// Keep the module loaded for the life of the process. `usize` keeps the
     /// static list `Send`.
     _lib: usize,
+    name: String,
+    frame_ticks: AtomicU64,
+    hud_ticks: AtomicU64,
+    worker_ticks: AtomicU64,
     frame: Option<CokeFrameFn>,
     /// API v3: called after every mod's `coke_frame`, when all world-space
     /// overlays are finished. Text/HUD drawing belongs here so a world overlay
@@ -605,12 +717,8 @@ pub(crate) fn sort_by_draw_order<T, F: Fn(&T) -> (i32, u32)>(items: &mut [T], ke
     items.sort_by_key(key);
 }
 
-static COKE_MODS: OnceLock<Mutex<Vec<CokeMod>>> = OnceLock::new();
+static COKE_MODS: OnceLock<Vec<CokeMod>> = OnceLock::new();
 static COKE_LOADED: AtomicU32 = AtomicU32::new(0);
-
-fn mods() -> &'static Mutex<Vec<CokeMod>> {
-    COKE_MODS.get_or_init(|| Mutex::new(Vec::new()))
-}
 
 /// Create `coke/` and load every consent-gated DLL in it. Called once from the
 /// watcher thread (never from `DllMain`, where `LoadLibrary` can deadlock under
@@ -649,6 +757,7 @@ pub unsafe fn load_coke_mods() {
         // the order the filesystem happened to return.
         names.sort_by_key(|n| n.to_ascii_lowercase());
 
+        let mut callbacks = Vec::new();
         let mut loaded = 0usize;
         for (order, name) in names.into_iter().enumerate() {
             let path = dir.join(&name);
@@ -680,20 +789,13 @@ pub unsafe fn load_coke_mods() {
                     ));
                 } else {
                     let init_ptr = resolve(lib, "coke_init");
-                    let mut accepted = true;
-                    let mut layer = 0i32;
-                    if !init_ptr.is_null() {
-                        let init: CokeInitFn = core::mem::transmute(init_ptr);
-                        INIT_ACTIVE.store(1, Ordering::Relaxed);
-                        PENDING_LAYER.store(0, Ordering::Relaxed);
-                        accepted = init(&COKE_HOST) != 0;
-                        INIT_ACTIVE.store(0, Ordering::Relaxed);
-                        layer = PENDING_LAYER.load(Ordering::Relaxed);
-                        if !accepted {
-                            log(&format!("coke: {name} declined initialization"));
-                        }
-                    }
-                    if accepted {
+                    let pending = if init_ptr.is_null() {
+                        Some(ModInit::default())
+                    } else {
+                        initialize_mod(core::mem::transmute::<*mut c_void, CokeInitFn>(init_ptr))
+                    };
+                    if let Some(pending) = pending {
+                        let layer = pending.layer;
                         let frame_ptr = resolve(lib, "coke_frame");
                         let frame: Option<CokeFrameFn> = if frame_ptr.is_null() {
                             None
@@ -712,18 +814,25 @@ pub unsafe fn load_coke_mods() {
                         } else {
                             Some(core::mem::transmute::<*mut c_void, CokeTickFn>(tick_ptr))
                         };
-                        {
-                            let mut guard = mods().lock().unwrap();
-                            guard.push(CokeMod {
-                                _lib: lib as usize,
-                                frame,
-                                hud,
-                                tick,
-                                layer,
-                                order: order as u32,
-                            });
-                            sort_by_draw_order(&mut guard, |m| (m.layer, m.order));
+                        callbacks.push(CokeMod {
+                            _lib: lib as usize,
+                            name: name.to_string(),
+                            frame_ticks: AtomicU64::new(0),
+                            hud_ticks: AtomicU64::new(0),
+                            worker_ticks: AtomicU64::new(0),
+                            frame,
+                            hud,
+                            tick,
+                            layer,
+                            order: order as u32,
+                        });
+                        if pending.enable_range_keys {
+                            crate::range::control(coke_host::RANGE_ENABLE_KEYS, core::ptr::null());
                         }
+                        if let Some(captured) = pending.camera_capture {
+                            set_camera_input_capture(captured);
+                        }
+                        hotkeys::publish(lib as usize, pending.hotkeys);
                         loaded += 1;
                         log(&format!(
                             "coke: loaded {name} (frame={} hud={} tick={} layer={layer})",
@@ -732,11 +841,14 @@ pub unsafe fn load_coke_mods() {
                             if tick.is_some() { "yes" } else { "no" }
                         ));
                     } else {
+                        log(&format!("coke: {name} declined initialization"));
                         FreeLibrary(lib);
                     }
                 }
             }
         }
+        sort_by_draw_order(&mut callbacks, |m| (m.layer, m.order));
+        let _ = COKE_MODS.set(callbacks);
         log(&format!("coke: {loaded} mod(s) loaded"));
         if loaded > 0 {
             start_mod_tick_thread();
@@ -745,18 +857,17 @@ pub unsafe fn load_coke_mods() {
 }
 
 /// Call every loaded mod's `coke_frame` hook. Runs on the GL thread inside
-/// `wglSwapBuffers`; `try_lock` keeps a stuck mod from stalling presentation.
+/// `wglSwapBuffers`, using the immutable callback list.
 /// Iteration follows the draw-order rule `(layer, load order)`, so overlapping
 /// world-space drawing respects a mod's requested layer.
 pub unsafe fn coke_frame(width: i32, height: i32, fps: f32) {
     unsafe {
-        if COKE_LOADED.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        if let Ok(guard) = mods().try_lock() {
-            for m in guard.iter() {
+        if let Some(callbacks) = COKE_MODS.get() {
+            for m in callbacks {
                 if let Some(frame) = m.frame {
-                    frame(width, height, fps);
+                    let previous = IN_RENDER_CALLBACK.replace(true);
+                    timed_callback(&m.frame_ticks, || frame(width, height, fps));
+                    IN_RENDER_CALLBACK.set(previous);
                 }
             }
         }
@@ -769,13 +880,12 @@ pub unsafe fn coke_frame(width: i32, height: i32, fps: f32) {
 /// Iteration uses the same `(layer, load order)` rule as `coke_frame`.
 pub unsafe fn coke_hud(width: i32, height: i32, fps: f32) {
     unsafe {
-        if COKE_LOADED.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        if let Ok(guard) = mods().try_lock() {
-            for m in guard.iter() {
+        if let Some(callbacks) = COKE_MODS.get() {
+            for m in callbacks {
                 if let Some(hud) = m.hud {
-                    hud(width, height, fps);
+                    let previous = IN_RENDER_CALLBACK.replace(true);
+                    timed_callback(&m.hud_ticks, || hud(width, height, fps));
+                    IN_RENDER_CALLBACK.set(previous);
                 }
             }
         }
@@ -786,15 +896,40 @@ pub unsafe fn coke_hud(width: i32, height: i32, fps: f32) {
 /// thread, never on the GL thread, so data scans cannot stall rendering.
 pub unsafe fn coke_tick() {
     unsafe {
-        if COKE_LOADED.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        if let Ok(guard) = mods().try_lock() {
-            for m in guard.iter() {
+        if let Some(callbacks) = COKE_MODS.get() {
+            for m in callbacks {
                 if let Some(tick) = m.tick {
-                    tick();
+                    timed_callback(&m.worker_ticks, || tick());
                 }
             }
+        }
+    }
+}
+
+fn timed_callback(counter: &AtomicU64, callback: impl FnOnce()) {
+    if perf::timing() {
+        let start = unsafe { qpc() };
+        callback();
+        let elapsed = unsafe { qpc() }.saturating_sub(start);
+        counter.fetch_add(elapsed, Ordering::Relaxed);
+    } else {
+        callback();
+    }
+}
+
+fn report_callback_times() {
+    if let Some(mods) = COKE_MODS.get() {
+        for m in mods {
+            let millis = |counter: &AtomicU64| {
+                perf::ticks_to_ns(counter.swap(0, Ordering::Relaxed)) as f64 / 1_000_000.0
+            };
+            log(&format!(
+                "coke: {} callback time over 5 s: world={:.2} ms hud={:.2} ms worker={:.2} ms",
+                m.name,
+                millis(&m.frame_ticks),
+                millis(&m.hud_ticks),
+                millis(&m.worker_ticks)
+            ));
         }
     }
 }
@@ -805,7 +940,11 @@ unsafe fn pin_worker_to_own_core() {
         let mut pmask = 0usize;
         let mut smask = 0usize;
         if GetProcessAffinityMask(GetCurrentProcess(), &mut pmask, &mut smask) == 0 || pmask == 0 {
-            pmask = 1;
+            log(&format!(
+                "coke: GetProcessAffinityMask failed: {}",
+                GetLastError()
+            ));
+            return;
         }
         let mut cpu = pmask.trailing_zeros() as usize;
         // Prefer the highest-numbered allowed CPU (usually the least used by a
@@ -825,7 +964,7 @@ unsafe fn pin_worker_to_own_core() {
                 if !th.is_null() {
                     // GetThreadIdealProcessor is not in the 32-bit import library;
                     // resolve it dynamically and fall back to the core choice above.
-                    let k32 = LoadLibraryW(wide("kernel32.dll").as_ptr());
+                    let k32 = GetModuleHandleW(wide("kernel32.dll").as_ptr());
                     let p = if k32.is_null() {
                         core::ptr::null_mut()
                     } else {
@@ -847,25 +986,46 @@ unsafe fn pin_worker_to_own_core() {
                 }
             }
         }
-        SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu);
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        log(&format!(
-            "coke: worker pinned to cpu {cpu} (process mask 0x{pmask:x}), priority below normal"
-        ));
+        if SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu) == 0 {
+            log(&format!(
+                "coke: could not pin mod worker to cpu {cpu}: {}",
+                GetLastError()
+            ));
+        } else {
+            log(&format!(
+                "coke: mod worker pinned to cpu {cpu} (process mask 0x{pmask:x})"
+            ));
+        }
+        if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) == 0 {
+            log(&format!(
+                "coke: could not lower mod worker priority: {}",
+                GetLastError()
+            ));
+        }
     }
 }
 
 extern "system" fn mod_tick_thread(_param: *mut c_void) -> u32 {
     unsafe {
-        // The engine window appears a few seconds after startup; pin once it
-        // exists so the chosen core can avoid the main thread's ideal processor.
-        let t0 = GetTickCount();
-        while MAIN_WINDOW.load(Ordering::Relaxed) == 0 && GetTickCount().wrapping_sub(t0) < 15_000 {
-            Sleep(50);
+        if config().mod_worker_affinity {
+            let t0 = GetTickCount();
+            while MAIN_WINDOW.load(Ordering::Acquire) == 0
+                && GetTickCount().wrapping_sub(t0) < 15_000
+            {
+                Sleep(50);
+            }
+            pin_worker_to_own_core();
         }
-        pin_worker_to_own_core();
+        let mut reported_at = GetTickCount();
         loop {
             coke_tick();
+            if perf::timing() {
+                let now = GetTickCount();
+                if now.wrapping_sub(reported_at) >= 5000 {
+                    reported_at = now;
+                    report_callback_times();
+                }
+            }
             Sleep(10);
         }
     }
@@ -874,7 +1034,7 @@ extern "system" fn mod_tick_thread(_param: *mut c_void) -> u32 {
 pub unsafe fn start_mod_tick_thread() {
     unsafe {
         let mut tid = 0u32;
-        CreateThread(
+        let worker = CreateThread(
             core::ptr::null_mut(),
             256 * 1024,
             mod_tick_thread,
@@ -882,13 +1042,79 @@ pub unsafe fn start_mod_tick_thread() {
             0,
             &mut tid,
         );
-        log(&format!("coke: worker thread {tid}"));
+        if worker.is_null() {
+            log(&format!("coke: worker thread failed: {}", GetLastError()));
+        } else {
+            CloseHandle(worker);
+            log(&format!("coke: worker thread {tid}"));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_mod_never_publishes_its_hotkey() {
+        static FIRED: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn fired() {
+            FIRED.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "system" fn decline(host: *const CokeHost) -> i32 {
+            let register = unsafe { (*host).register_hotkey.unwrap() };
+            assert_eq!(unsafe { register(0x71, Some(fired)) }, 1);
+            0
+        }
+        assert!(initialize_mod(decline).is_none());
+        hotkeys::press_for_test(0x71);
+        assert_eq!(FIRED.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn los_validates_element_spans_and_disjoint_outputs() {
+        let mut heights = [0.0f32; 8];
+        let mut vis = [0u8; 8];
+        let mut nx = 0;
+        let mut nz = 0;
+        unsafe {
+            let h = heights.as_mut_ptr();
+            assert_eq!(mod_span(h, 8, true).unwrap().len(), 32);
+            assert!(los_outputs(vis.as_mut_ptr(), 8, h, 8, &mut nx, &mut nz));
+            assert!(!los_outputs(
+                h.cast::<u8>().add(16),
+                8,
+                h,
+                8,
+                &mut nx,
+                &mut nz
+            ));
+            assert!(!los_outputs(
+                vis.as_mut_ptr(),
+                8,
+                h,
+                8,
+                &raw mut nx,
+                &raw mut nx
+            ));
+            assert!(!los_outputs(
+                vis.as_mut_ptr(),
+                8,
+                h,
+                8,
+                h.cast::<i32>().add(4),
+                &mut nz
+            ));
+            assert!(!los_outputs(
+                vis.as_mut_ptr(),
+                8,
+                h,
+                u32::MAX,
+                &mut nx,
+                &mut nz
+            ));
+        }
+    }
 
     #[test]
     fn draw_order_is_layer_then_load_order() {
@@ -921,10 +1147,21 @@ mod tests {
         assert!(copied.camera_apply.is_some());
         assert!(copied.range_control.is_none());
         assert!(copied.range_read.is_none());
+        assert!(copied.range_capabilities.is_none());
     }
 
+    const _: () = {
+        assert!(core::mem::offset_of!(CokeHost, size) == 24);
+        assert!(core::mem::offset_of!(CokeHost, draw_world_lines) == 112);
+        assert!(coke_host::COKE_HOST_V2_1_SIZE == 124);
+        assert!(coke_host::COKE_HOST_V4_SIZE == 132);
+        assert!(coke_host::COKE_HOST_V6_SIZE == 144);
+        assert!(coke_host::COKE_HOST_V7_SIZE == 152);
+        assert!(size_of::<CokeHost>() == 156);
+    };
+
     #[test]
-    fn host_api_reports_v7() {
-        assert_eq!(COKE_HOST.api_version, 7);
+    fn host_api_reports_v8() {
+        assert_eq!(COKE_HOST.api_version, 8);
     }
 }

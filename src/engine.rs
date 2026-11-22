@@ -1,112 +1,209 @@
 //! Patching the packed engine's in-memory user32 import slots.
 
 use crate::*;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::ffi::c_void;
 
 // ---- code ----
 // ------------------------------------------------------------- slot hooking
 
-pub unsafe fn write_slot(slot: usize, value: usize) {
-    unsafe {
-        let mut old = 0u32;
-        VirtualProtect(slot as *mut c_void, 4, PAGE_EXECUTE_READWRITE, &mut old);
-        core::ptr::write_unaligned(slot as *mut usize, value);
-        VirtualProtect(slot as *mut c_void, 4, old, &mut old);
+/// Read only aligned slots backed by the expected image allocation.
+unsafe fn image_slot(base: usize, end: usize, slot: usize) -> Option<usize> {
+    let len = size_of::<usize>();
+    let stop = slot.checked_add(len)?;
+    if slot < base || stop > end || !slot.is_multiple_of(len) {
+        return None;
     }
-}
-
-/// Rewrites the slot only if it does not already point at our hook, so the
-/// steady-state poll costs three reads and no protection changes.
-pub unsafe fn ensure_slot(slot: usize, hook: usize) {
     unsafe {
-        let current = core::ptr::read_unaligned(slot as *const usize);
-        if current != hook {
-            write_slot(slot, hook);
+        let mut info: MemBasicInfo = core::mem::zeroed();
+        if VirtualQuery(slot as *const c_void, &mut info, size_of::<MemBasicInfo>()) == 0
+            || info.allocation_base as usize != base
+            || info.state != MEM_COMMIT
+            || info.protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || !matches!(info.protect & 0xff, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
+            || stop > (info.base_address as usize).checked_add(info.region_size)?
+        {
+            return None;
         }
+        Some((&*(slot as *const AtomicUsize)).load(Ordering::Relaxed))
     }
 }
 
-/// The packed CMBS image has a fixed base, so its slots are known from the
-/// profile. Other CM titles use a different build; for them the generic scanner
-/// below finds the same user32 pointers in the module image after the packer has
-/// built the IAT.
+unsafe fn replace_slot(base: usize, end: usize, slot: usize, expected: usize, hook: usize) -> bool {
+    unsafe {
+        if expected == 0 || image_slot(base, end, slot) != Some(expected) {
+            return false;
+        }
+        let len = size_of::<usize>();
+        let mut old = 0;
+        if VirtualProtect(slot as *mut c_void, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        let changed = (&*(slot as *const AtomicUsize))
+            .compare_exchange(expected, hook, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
+        let mut ignored = 0;
+        if VirtualProtect(slot as *mut c_void, len, old, &mut ignored) == 0 {
+            log(&format!(
+                "slots: could not restore protection at 0x{slot:x}"
+            ));
+        }
+        changed
+    }
+}
+
 pub unsafe fn install_slot_hooks() {
+    if !profile_ok() {
+        return;
+    }
     unsafe {
-        let cfg = config().clone();
-        static SLOTS_LOGGED: AtomicU32 = AtomicU32::new(0);
-        if profile_ok() {
-            if SLOTS_LOGGED.swap(1, Ordering::Relaxed) == 0 {
-                let read = |slot: Option<usize>| match slot {
-                    Some(s) => format!("0x{:x}", core::ptr::read_unaligned(s as *const usize)),
-                    None => "unavailable".to_string(),
-                };
-                log(&format!(
-                    "slots: CloseWindow={} GetSystemMetrics={} ChangeDisplaySettingsA={} GetCursorPos={}",
-                    read(slot_close_window()),
-                    read(slot_get_system_metrics()),
-                    read(slot_change_display()),
-                    read(slot_get_cursor_pos())
-                ));
-            }
-            let mask = SLOT_OK_MASK.load(Ordering::Relaxed);
-            let install = |bit: u32, slot: Option<usize>, real: usize, hook: usize| {
-                if bit == 0 || mask & bit == 0 || real == 0 {
-                    return;
-                }
-                if let Some(slot) = slot {
-                    ensure_slot(slot, hook);
-                }
-            };
-            install(
-                if cfg.fix_alt_tab {
-                    SLOT_BIT_CLOSE_WINDOW
-                } else {
-                    0
-                },
-                slot_close_window(),
-                REAL_CLOSE_WINDOW.load(Ordering::Relaxed),
-                hook_close_window as *const () as usize,
-            );
-            install(
-                SLOT_BIT_GET_SYSTEM_METRICS,
-                slot_get_system_metrics(),
-                REAL_METRICS.load(Ordering::Relaxed),
-                hook_metrics as *const () as usize,
-            );
-            install(
-                SLOT_BIT_CHANGE_DISPLAY,
-                slot_change_display(),
-                REAL_CHANGE_DISPLAY.load(Ordering::Relaxed),
-                hook_change_display as *const () as usize,
-            );
-            install(
-                SLOT_BIT_GET_CURSOR_POS,
-                slot_get_cursor_pos(),
-                REAL_GET_CURSOR_POS.load(Ordering::Relaxed),
-                hook_get_cursor_pos as *const () as usize,
-            );
+        let base = module_base();
+        let Some(end) = base.checked_add(run_image_size() as usize) else {
+            return;
+        };
+        static LAST_IMPORT_CHECK: AtomicU32 = AtomicU32::new(0);
+        let now = GetTickCount();
+        let last = LAST_IMPORT_CHECK.load(Ordering::Relaxed);
+        if (last == 0 || now.wrapping_sub(last) >= 500)
+            && LAST_IMPORT_CHECK
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            install_verified_imports(base, end);
         }
-
-        // ShowWindow is not part of the profile's slot list. It is also the generic
-        // fallback for other CM titles, so scan for it until it has been found.
-        // The generic scanner is also the fallback for any profile slot that is
-        // missing or failed its content check.
-        let pending = slots_pending();
-        if pending && SCAN_TICKS.load(Ordering::Relaxed) < 24 {
-            let now = GetTickCount();
-            let last = LAST_SCAN_MS.load(Ordering::Relaxed);
-            // A full image scan is not free; a few passes over the startup window
-            // are enough for a packed image to have built its import table.
-            if last == 0 || now.wrapping_sub(last) >= 500 {
-                LAST_SCAN_MS.store(now, Ordering::Relaxed);
-                scan_slots();
+        for (slot, expected, hook, name) in profile_slots() {
+            if let Some(slot) = slot
+                && replace_slot(base, end, slot, expected, hook)
+            {
+                log(&format!("slots: installed {name} at 0x{slot:x}"));
             }
         }
     }
 }
 
-/// Size of the main module image, read from its in-memory PE header.
+/// Match an import's DLL and name through its original lookup table before
+/// considering the bound IAT word. Packed executables may omit this metadata.
+unsafe fn install_verified_imports(base: usize, end: usize) {
+    let imports = profile_slots();
+    let addr = |rva: usize, len: usize| {
+        let start = base.checked_add(rva)?;
+        (start.checked_add(len)? <= end).then_some(start)
+    };
+    let word = |rva| unsafe { rd_u32(addr(rva, 4)?) }.map(|n| n as usize);
+    let named = |rva, expected: &str| {
+        let mut bytes = [0; 32];
+        let n = expected.len();
+        addr(rva, n + 1).is_some_and(|p| unsafe { rd_bytes(p, &mut bytes[..=n]) })
+            && bytes[n] == 0
+            && bytes[..n].eq_ignore_ascii_case(expected.as_bytes())
+    };
+    let Some(nt) = word(0x3c).filter(|&nt| addr(nt, 0x88).is_some() && word(nt) == Some(0x4550))
+    else {
+        return;
+    };
+    if word(nt + 24).is_none_or(|header| header & 0xffff != 0x10b) {
+        return;
+    }
+    let (Some(directory), Some(bytes)) = (word(nt + 0x80), word(nt + 0x84)) else {
+        return;
+    };
+    if directory == 0 || addr(directory, bytes).is_none() {
+        return;
+    }
+    for descriptor in (directory..directory + bytes / 20 * 20)
+        .step_by(20)
+        .take(1024)
+    {
+        let (Some(lookup), Some(name), Some(iat)) = (
+            word(descriptor),
+            word(descriptor + 12),
+            word(descriptor + 16),
+        ) else {
+            break;
+        };
+        if lookup == 0 || iat == 0 || !named(name, "user32.dll") {
+            continue;
+        }
+        for offset in (0..16_384).step_by(4) {
+            let Some(import) = lookup
+                .checked_add(offset)
+                .and_then(word)
+                .filter(|&import| import != 0)
+            else {
+                break;
+            };
+            if import & 0x8000_0000 != 0 {
+                continue;
+            }
+            let Some(slot) = iat.checked_add(offset).and_then(|rva| addr(rva, 4)) else {
+                break;
+            };
+            for (_, expected, hook, name) in imports {
+                if name == "CloseWindow" && !config().fix_alt_tab {
+                    continue;
+                }
+                if unsafe { image_slot(base, end, slot) } == Some(expected)
+                    && expected != 0
+                    && named(import + 2, name)
+                    && unsafe { replace_slot(base, end, slot, expected, hook) }
+                {
+                    log(&format!(
+                        "slots: installed verified {name} import at 0x{slot:x}"
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn profile_slots() -> [(Option<usize>, usize, usize, &'static str); 7] {
+    [
+        (
+            slot_close_window().filter(|_| config().fix_alt_tab),
+            REAL_CLOSE_WINDOW.load(Ordering::Relaxed),
+            hook_close_window as *const () as usize,
+            "CloseWindow",
+        ),
+        (
+            slot_get_system_metrics(),
+            REAL_METRICS.load(Ordering::Relaxed),
+            hook_metrics as *const () as usize,
+            "GetSystemMetrics",
+        ),
+        (
+            slot_change_display(),
+            REAL_CHANGE_DISPLAY.load(Ordering::Relaxed),
+            hook_change_display as *const () as usize,
+            "ChangeDisplaySettingsA",
+        ),
+        (
+            slot_get_cursor_pos(),
+            REAL_GET_CURSOR_POS.load(Ordering::Relaxed),
+            hook_get_cursor_pos as *const () as usize,
+            "GetCursorPos",
+        ),
+        (
+            slots().and_then(|s| slot_addr(s.show_window)),
+            REAL_SHOW_WINDOW.load(Ordering::Relaxed),
+            hook_show_window as *const () as usize,
+            "ShowWindow",
+        ),
+        (
+            slots().and_then(|s| slot_addr(s.show_window_async)),
+            REAL_SHOW_WINDOW_ASYNC.load(Ordering::Relaxed),
+            hook_show_window_async as *const () as usize,
+            "ShowWindowAsync",
+        ),
+        (
+            slots().and_then(|s| slot_addr(s.get_async_key_state)),
+            REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed),
+            hook_async_key_state as *const () as usize,
+            "GetAsyncKeyState",
+        ),
+    ]
+}
+
 pub unsafe fn module_image_size(base: usize) -> usize {
     unsafe {
         if base == 0 {
@@ -481,262 +578,88 @@ pub fn slot_get_cursor_pos() -> Option<usize> {
 /// loaded image; a mismatch disables only that hook.
 pub unsafe fn validate_profile_slots() {
     unsafe {
-        let mut mask = 0u32;
-        let mut check = |bit: u32, slot: Option<usize>, real: usize, name: &str| {
-            let (Some(slot), real) = (slot, real) else {
-                return;
-            };
-            if real == 0 {
-                // The real function did not resolve; leave the bit clear so the
-                // generic scanner can still find the slot by value elsewhere.
-                return;
-            }
-            let actual = core::ptr::read_unaligned(slot as *const usize);
-            if actual == real {
-                mask |= bit;
-            } else {
-                log(&format!(
-                    "slots: {name} content mismatch at 0x{slot:x}: 0x{actual:x} != 0x{real:x}; \
-                 hook disabled, scanner will retry"
-                ));
-            }
+        let base = module_base();
+        let Some(end) = base.checked_add(run_image_size() as usize) else {
+            return;
         };
-        check(
-            SLOT_BIT_CLOSE_WINDOW,
-            slot_close_window(),
-            REAL_CLOSE_WINDOW.load(Ordering::Relaxed),
-            "CloseWindow",
-        );
-        check(
-            SLOT_BIT_GET_SYSTEM_METRICS,
-            slot_get_system_metrics(),
-            REAL_METRICS.load(Ordering::Relaxed),
-            "GetSystemMetrics",
-        );
-        check(
-            SLOT_BIT_CHANGE_DISPLAY,
-            slot_change_display(),
-            REAL_CHANGE_DISPLAY.load(Ordering::Relaxed),
-            "ChangeDisplaySettingsA",
-        );
-        check(
-            SLOT_BIT_GET_CURSOR_POS,
-            slot_get_cursor_pos(),
-            REAL_GET_CURSOR_POS.load(Ordering::Relaxed),
-            "GetCursorPos",
-        );
-        SLOT_OK_MASK.store(mask, Ordering::Relaxed);
-        let configured = slots().map(|s| s.any()).unwrap_or(false);
-        if configured {
-            log(&format!(
-                "slots: content check {}/4 passed",
-                mask.count_ones()
-            ));
+        for (slot, expected, hook, name) in profile_slots() {
+            if let Some(slot) = slot {
+                let actual = image_slot(base, end, slot);
+                if actual != Some(expected) && actual != Some(hook) {
+                    log(&format!(
+                        "slots: {name} at 0x{slot:x} has unexpected value {actual:?}; will retry when imports resolve"
+                    ));
+                }
+            }
         }
     }
 }
 
-/// Scan the main module's committed pages for function pointers that still
-/// point at the real user32 functions, and replace them with our hooks.
-///
-/// The shipped executables are packed and build their import tables in memory,
-/// so there is no usable import directory to walk. Matching the exact user32
-/// pointer value is the one build-independent way to find those slots.
-pub unsafe fn scan_slots() {
+/// Candidate discovery for packed builds. These values do not authorize a patch.
+pub unsafe fn diagnose_slots(base: usize, size: usize) {
     unsafe {
-        let base = GetModuleHandleW(core::ptr::null()) as usize;
-        let size = module_image_size(base);
-        if base == 0 || size == 0 || !slots_pending() {
+        let Some(end) = base.checked_add(size) else {
             return;
-        }
-
-        let mask = SLOT_OK_MASK.load(Ordering::Relaxed);
-        let mut reals = [0usize; 7];
-        let mut hooks = [0usize; 7];
-        let mut counts = [0u32; 7];
-        let mut first = [0usize; 7];
-        let mut n = 0usize;
-
-        let mut add = |real: usize, hook: usize| {
-            if real != 0 && n < reals.len() {
-                reals[n] = real;
-                hooks[n] = hook;
-                n += 1;
-            }
         };
-
-        // Slots the profile supplied *and* that passed the content check are
-        // already patched; only the missing/failed ones are searched for here.
-        if mask & SLOT_BIT_CLOSE_WINDOW == 0 {
-            add(
-                REAL_CLOSE_WINDOW.load(Ordering::Relaxed),
-                hook_close_window as *const () as usize,
-            );
-        }
-        if mask & SLOT_BIT_GET_SYSTEM_METRICS == 0 {
-            add(
-                REAL_METRICS.load(Ordering::Relaxed),
-                hook_metrics as *const () as usize,
-            );
-        }
-        if mask & SLOT_BIT_CHANGE_DISPLAY == 0 {
-            add(
+        let targets = [
+            ("CloseWindow", REAL_CLOSE_WINDOW.load(Ordering::Relaxed)),
+            ("GetSystemMetrics", REAL_METRICS.load(Ordering::Relaxed)),
+            (
+                "ChangeDisplaySettingsA",
                 REAL_CHANGE_DISPLAY.load(Ordering::Relaxed),
-                hook_change_display as *const () as usize,
-            );
-        }
-        if mask & SLOT_BIT_GET_CURSOR_POS == 0 {
-            add(
-                REAL_GET_CURSOR_POS.load(Ordering::Relaxed),
-                hook_get_cursor_pos as *const () as usize,
-            );
-        }
-        if SCAN_SHOW.load(Ordering::Relaxed) == 0 {
-            add(
-                REAL_SHOW_WINDOW.load(Ordering::Relaxed),
-                hook_show_window as *const () as usize,
-            );
-        }
-        if SCAN_SHOW_ASYNC.load(Ordering::Relaxed) == 0 {
-            add(
+            ),
+            ("GetCursorPos", REAL_GET_CURSOR_POS.load(Ordering::Relaxed)),
+            ("ShowWindow", REAL_SHOW_WINDOW.load(Ordering::Relaxed)),
+            (
+                "ShowWindowAsync",
                 REAL_SHOW_WINDOW_ASYNC.load(Ordering::Relaxed),
-                hook_show_window_async as *const () as usize,
-            );
-        }
-        if REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed) != 0 {
-            add(
+            ),
+            (
+                "GetAsyncKeyState",
                 REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed),
-                hook_async_key_state as *const () as usize,
-            );
-        }
-        if n == 0 {
-            return;
-        }
-
-        let image_end = base + size;
+            ),
+        ];
+        let mut counts = [0; 7];
         let mut addr = base;
-        while addr < image_end {
+        while addr < end {
             let mut info: MemBasicInfo = core::mem::zeroed();
-            let got = VirtualQuery(
-                addr as *const c_void,
-                &mut info,
-                core::mem::size_of::<MemBasicInfo>(),
-            );
-            if got != core::mem::size_of::<MemBasicInfo>() {
+            if VirtualQuery(addr as *const c_void, &mut info, size_of::<MemBasicInfo>()) == 0 {
                 break;
             }
-            let rbase = info.base_address as usize;
-            let rsize = info.region_size.max(1);
-            let next = rbase.saturating_add(rsize);
+            let next = (info.base_address as usize)
+                .saturating_add(info.region_size)
+                .min(end);
             if next <= addr {
                 break;
             }
-            addr = next;
-
-            if info.state != MEM_COMMIT
-                || info.protect & PAGE_NOACCESS != 0
-                || info.protect & PAGE_GUARD != 0
+            if info.allocation_base as usize == base
+                && info.state == MEM_COMMIT
+                && info.protect & PAGE_GUARD == 0
+                && matches!(info.protect & 0xff, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
             {
-                continue;
-            }
-
-            let start = rbase.max(base);
-            let end = next.min(image_end);
-            if start >= end {
-                continue;
-            }
-
-            let mut old = 0u32;
-            if VirtualProtect(
-                start as *mut c_void,
-                end - start,
-                PAGE_EXECUTE_READWRITE,
-                &mut old,
-            ) == 0
-            {
-                continue;
-            }
-            let mut p = (start + 3) & !3;
-            while p + 4 <= end {
-                let value = core::ptr::read_unaligned(p as *const usize);
-                for i in 0..n {
-                    if value == reals[i] && counts[i] < 4096 {
-                        if first[i] == 0 {
-                            first[i] = p;
+                let mut page = [0u8; 4096];
+                for chunk in (addr..next).step_by(page.len()) {
+                    let length = (next - chunk).min(page.len());
+                    if !rd_bytes(chunk, &mut page[..length]) {
+                        continue;
+                    }
+                    for (word, bytes) in page[..length].as_chunks::<4>().0.iter().enumerate() {
+                        let value = u32::from_le_bytes(*bytes) as usize;
+                        for (index, (name, expected)) in targets.iter().enumerate() {
+                            if value != 0 && value == *expected && counts[index] < 8 {
+                                counts[index] += 1;
+                                log(&format!(
+                                    "IAT scan: {name} candidate RVA 0x{:x}",
+                                    chunk + word * 4 - base
+                                ));
+                            }
                         }
-                        core::ptr::write_unaligned(p as *mut usize, hooks[i]);
-                        counts[i] += 1;
                     }
                 }
-                p += 4;
             }
-            let mut ignored = 0u32;
-            VirtualProtect(start as *mut c_void, end - start, old, &mut ignored);
+            addr = next;
         }
-
-        let mut new_mask = mask;
-        for i in 0..n {
-            if counts[i] == 0 {
-                continue;
-            }
-            let real = reals[i];
-            if real == REAL_SHOW_WINDOW.load(Ordering::Relaxed) {
-                SCAN_SHOW.store(1, Ordering::Relaxed);
-                log(&format!(
-                    "IAT scan: ShowWindow slot(s) patched: {}",
-                    counts[i]
-                ));
-            } else if real == REAL_SHOW_WINDOW_ASYNC.load(Ordering::Relaxed) {
-                SCAN_SHOW_ASYNC.store(1, Ordering::Relaxed);
-                log(&format!(
-                    "IAT scan: ShowWindowAsync slot(s) patched: {}",
-                    counts[i]
-                ));
-            } else if real == REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed) {
-                SCAN_ASYNC_KEY.store(1, Ordering::Relaxed);
-                log(&format!(
-                    "IAT scan: GetAsyncKeyState slot(s) patched: {}",
-                    counts[i]
-                ));
-            } else {
-                let name = if real == REAL_CLOSE_WINDOW.load(Ordering::Relaxed) {
-                    new_mask |= SLOT_BIT_CLOSE_WINDOW;
-                    "CloseWindow"
-                } else if real == REAL_METRICS.load(Ordering::Relaxed) {
-                    new_mask |= SLOT_BIT_GET_SYSTEM_METRICS;
-                    "GetSystemMetrics"
-                } else if real == REAL_CHANGE_DISPLAY.load(Ordering::Relaxed) {
-                    new_mask |= SLOT_BIT_CHANGE_DISPLAY;
-                    "ChangeDisplaySettingsA"
-                } else if real == REAL_GET_CURSOR_POS.load(Ordering::Relaxed) {
-                    new_mask |= SLOT_BIT_GET_CURSOR_POS;
-                    "GetCursorPos"
-                } else {
-                    "user32"
-                };
-                log(&format!(
-                    "IAT scan: {name} slot=0x{:x} rva=0x{:x} sites={}",
-                    first[i],
-                    first[i].wrapping_sub(base),
-                    counts[i]
-                ));
-            }
-        }
-        SLOT_OK_MASK.store(new_mask, Ordering::Relaxed);
-        SCAN_TICKS.fetch_add(1, Ordering::Relaxed);
     }
-}
-
-pub fn slots_pending() -> bool {
-    let mask = SLOT_OK_MASK.load(Ordering::Relaxed);
-    SCAN_SHOW.load(Ordering::Relaxed) == 0
-        || SCAN_SHOW_ASYNC.load(Ordering::Relaxed) == 0
-        || (mask & SLOT_BIT_GET_SYSTEM_METRICS == 0 && REAL_METRICS.load(Ordering::Relaxed) != 0)
-        || (mask & SLOT_BIT_GET_CURSOR_POS == 0 && REAL_GET_CURSOR_POS.load(Ordering::Relaxed) != 0)
-        || (mask & SLOT_BIT_CHANGE_DISPLAY == 0 && REAL_CHANGE_DISPLAY.load(Ordering::Relaxed) != 0)
-        || (mask & SLOT_BIT_CLOSE_WINDOW == 0 && REAL_CLOSE_WINDOW.load(Ordering::Relaxed) != 0)
-        || (SCAN_ASYNC_KEY.load(Ordering::Relaxed) == 0
-            && REAL_ASYNC_KEY_STATE.load(Ordering::Relaxed) != 0)
 }
 
 /// Return neutral state for camera keys/buttons while a mod owns the camera.
@@ -793,6 +716,51 @@ mod tests {
         b[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
         b[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // code+exec
         b
+    }
+
+    #[test]
+    fn slot_write_refuses_unexpected_values_and_failed_protection() {
+        unsafe extern "system" {
+            fn CreateFileMappingW(
+                file: Handle,
+                security: *mut c_void,
+                protect: u32,
+                high: u32,
+                low: u32,
+                name: *const u16,
+            ) -> Handle;
+            fn MapViewOfFile(
+                mapping: Handle,
+                access: u32,
+                high: u32,
+                low: u32,
+                size: usize,
+            ) -> *mut c_void;
+            fn UnmapViewOfFile(view: *const c_void) -> i32;
+        }
+        unsafe {
+            let mapping = CreateFileMappingW(
+                (-1isize) as Handle,
+                core::ptr::null_mut(),
+                PAGE_READWRITE,
+                0,
+                4096,
+                core::ptr::null(),
+            );
+            assert!(!mapping.is_null());
+            let writer = MapViewOfFile(mapping, 2, 0, 0, 4096);
+            let reader = MapViewOfFile(mapping, 4, 0, 0, 4096);
+            assert!(!writer.is_null() && !reader.is_null());
+            writer.cast::<usize>().write(7);
+            let slot = reader as usize;
+            assert_eq!(image_slot(slot, slot + 4096, slot), Some(7));
+            assert!(!replace_slot(slot, slot + 4096, slot, 6, 9));
+            assert!(!replace_slot(slot, slot + 4096, slot, 7, 9));
+            assert_eq!(image_slot(slot, slot + 4096, slot), Some(7));
+            UnmapViewOfFile(reader);
+            UnmapViewOfFile(writer);
+            CloseHandle(mapping);
+        }
     }
 
     #[test]

@@ -17,59 +17,262 @@ pub extern "system" fn init_thread(param: *mut core::ffi::c_void) -> u32 {
 /// This module is loaded as `opengl32.dll`, so `LoadLibraryExW` on the System32
 /// `opengl32.dll` returns *this* module again (the loader matches by base name).
 /// Keep a copy under a different name and load that instead.
-pub unsafe fn real_dll_path() -> Option<PathBuf> {
-    unsafe {
-        // The copy always lives outside the game folder. Loading a same-named file
-        // from next to the EXE would let a stray `opengl32_real.dll` replace the
-        // real system DLL instead of the proxy's private copy.
-        let mut buf = [0u16; 512];
-        let n = GetEnvironmentVariableW(
-            wide("LOCALAPPDATA").as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-        );
-        if n == 0 || n as usize >= buf.len() {
-            return None;
-        }
-        let target_dir = PathBuf::from(str_from_wide(buf.as_ptr())).join(TEMP_DIR);
-        let _ = CreateDirectoryW(
-            wide(&target_dir.to_string_lossy()).as_ptr(),
-            core::ptr::null_mut(),
-        );
-        let target = target_dir.join(REAL_DLL);
+unsafe fn real_dll_path() -> Option<PathBuf> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
 
-        let mut sysdir = [0u16; 260];
-        let n = GetSystemDirectoryW(sysdir.as_mut_ptr(), sysdir.len() as u32);
-        if n == 0 || n as usize >= sysdir.len() {
-            return None;
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(TEMP_DIR);
+    if !local.is_absolute() {
+        return None;
+    }
+    let mut sysdir = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(sysdir.as_mut_ptr(), sysdir.len() as u32) };
+    if n == 0 || n as usize >= sysdir.len() {
+        return None;
+    }
+    let source = PathBuf::from(unsafe { str_from_wide(sysdir.as_ptr()) }).join("opengl32.dll");
+    let image = fs::read(source).ok()?;
+    if image.is_empty() {
+        return None;
+    }
+    let signature = image.iter().fold(0xcbf29ce484222325u64, |hash, &byte| {
+        (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+    });
+
+    // Never truncate a DLL another game is about to load. Windows updates get
+    // a fresh directory, and concurrent processes can reuse a complete copy.
+    let dir = local.join(format!("{signature:016x}"));
+    fs::create_dir_all(&dir).ok()?;
+    if !ordinary_directory(&local) || !ordinary_directory(&dir) {
+        return None;
+    }
+    let target = dir.join(REAL_DLL);
+    let complete = || fs::read(&target).is_ok_and(|existing| existing == image);
+    if complete() {
+        return Some(target);
+    }
+
+    let temp = dir.join(format!("coke-{}-{}.tmp", std::process::id(), unsafe {
+        GetTickCount()
+    }));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .ok()?;
+    let prepared = file
+        .write_all(&image)
+        .and_then(|()| file.sync_all())
+        .is_ok();
+    drop(file);
+    if prepared {
+        let from: Vec<u16> = temp.as_os_str().encode_wide().chain([0]).collect();
+        let to: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Some(target);
         }
-        let source = PathBuf::from(str_from_wide(sysdir.as_ptr())).join("opengl32.dll");
-        if !source.exists() {
-            return None;
+    }
+    let _ = fs::remove_file(temp);
+    complete().then_some(target)
+}
+
+// The sole writer fills the table completely before publishing its address.
+pub(crate) static FORWARD_TABLE: std::sync::atomic::AtomicPtr<usize> =
+    std::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+static FORWARD_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn require_forwarding() {
+    if !*FORWARD_READY.get_or_init(|| unsafe { load_forwarding() }) {
+        // Arbitrary GL exports have different stack cleanup and return types.
+        // Fail the process explicitly rather than jump to an invalid address.
+        std::process::abort();
+    }
+}
+
+// x86 system exports take arguments on the caller's stack. The generated
+// slow path balances its own cdecl argument before tail-jumping to OpenGL.
+pub(crate) extern "C" fn first_forward(index: usize) -> usize {
+    require_forwarding();
+    unsafe { *FORWARD_TABLE.load(Ordering::Acquire).add(index) }
+}
+
+unsafe fn load_forwarding() -> bool {
+    unsafe {
+        let Some(path) = real_dll_path() else {
+            log("OpenGL forwarding: cannot prepare the system DLL");
+            return false;
+        };
+        use std::os::windows::ffi::OsStrExt;
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let module = LoadLibraryExW(
+            wide_path.as_ptr(),
+            core::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+        if module.is_null() || module as usize == INSTANCE_BASE.load(Ordering::Acquire) {
+            log(&format!(
+                "OpenGL forwarding: cannot load {}",
+                path.display()
+            ));
+            return false;
         }
-        let src_len = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
-        let dst_len = std::fs::metadata(&target)
-            .map(|m| m.len())
-            .unwrap_or(u64::MAX);
-        if src_len != dst_len {
-            let ok = CopyFileW(
-                wide(&source.to_string_lossy()).as_ptr(),
-                wide(&target.to_string_lossy()).as_ptr(),
-                0,
-            );
-            if ok == 0 {
-                return None;
+        let mut table = Box::new([0; FORWARDED_COUNT]);
+        for (slot, name) in table.iter_mut().zip(FORWARDED_NAMES) {
+            *slot = resolve(module, name) as usize;
+            if *slot == 0 {
+                log(&format!("OpenGL forwarding: missing {name}"));
+                FreeLibrary(module);
+                return false;
             }
         }
-        Some(target)
+        for name in INTERCEPTED_NAMES {
+            if resolve(module, name).is_null() {
+                log(&format!("OpenGL forwarding: missing {name}"));
+                FreeLibrary(module);
+                return false;
+            }
+        }
+
+        REAL_WGL_CREATE_CONTEXT.store(
+            resolve(module, "wglCreateContext") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_WGL_MAKE_CURRENT.store(
+            resolve(module, "wglMakeCurrent") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_WGL_DELETE_CONTEXT.store(
+            resolve(module, "wglDeleteContext") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_WGL_GET_PROC_ADDRESS.store(
+            resolve(module, "wglGetProcAddress") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_WGL_SWAP_BUFFERS.store(
+            resolve(module, "wglSwapBuffers") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_WGL_SHARE_LISTS.store(resolve(module, "wglShareLists") as usize, Ordering::Relaxed);
+        REAL_WGL_GET_CURRENT_CONTEXT.store(
+            resolve(module, "wglGetCurrentContext") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_WGL_GET_CURRENT_DC.store(
+            resolve(module, "wglGetCurrentDC") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_GET_STRING.store(resolve(module, "glGetString") as usize, Ordering::Relaxed);
+        REAL_GL_VIEWPORT.store(resolve(module, "glViewport") as usize, Ordering::Relaxed);
+        REAL_GL_SCISSOR.store(resolve(module, "glScissor") as usize, Ordering::Relaxed);
+        REAL_GL_RASTER_POS2I.store(resolve(module, "glRasterPos2i") as usize, Ordering::Relaxed);
+        REAL_GL_RASTER_POS3F.store(resolve(module, "glRasterPos3f") as usize, Ordering::Relaxed);
+        REAL_GL_READ_PIXELS.store(resolve(module, "glReadPixels") as usize, Ordering::Relaxed);
+        REAL_GL_COPY_TEX_SUB_IMAGE2D.store(
+            resolve(module, "glCopyTexSubImage2D") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_COPY_TEX_IMAGE2D.store(
+            resolve(module, "glCopyTexImage2D") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_DRAW_PIXELS.store(resolve(module, "glDrawPixels") as usize, Ordering::Relaxed);
+        REAL_GL_DISABLE.store(resolve(module, "glDisable") as usize, Ordering::Relaxed);
+        REAL_GL_ENABLE.store(resolve(module, "glEnable") as usize, Ordering::Relaxed);
+        // OpenGL 1.1 entry points live in opengl32.dll's export table and
+        // wglGetProcAddress returns NULL for them, so they have to come from
+        // GetProcAddress like every other forwarded function.
+        REAL_GL_GET_BOOLEANV.store(resolve(module, "glGetBooleanv") as usize, Ordering::Relaxed);
+        REAL_GL_GET_FLOATV.store(resolve(module, "glGetFloatv") as usize, Ordering::Relaxed);
+        REAL_GL_GET_INTEGERV.store(resolve(module, "glGetIntegerv") as usize, Ordering::Relaxed);
+        // Triangle overlay (cokelos and future mods).
+        REAL_GL_BLEND_FUNC.store(resolve(module, "glBlendFunc") as usize, Ordering::Relaxed);
+        REAL_GL_MATRIX_MODE.store(resolve(module, "glMatrixMode") as usize, Ordering::Relaxed);
+        REAL_GL_LOAD_IDENTITY.store(
+            resolve(module, "glLoadIdentity") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_PUSH_MATRIX.store(resolve(module, "glPushMatrix") as usize, Ordering::Relaxed);
+        REAL_GL_POP_MATRIX.store(resolve(module, "glPopMatrix") as usize, Ordering::Relaxed);
+        REAL_GL_ORTHO.store(resolve(module, "glOrtho") as usize, Ordering::Relaxed);
+        REAL_GL_VERTEX_POINTER.store(
+            resolve(module, "glVertexPointer") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_COLOR_POINTER.store(
+            resolve(module, "glColorPointer") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_COLOR_3F.store(resolve(module, "glColor3f") as usize, Ordering::Relaxed);
+        REAL_GL_DRAW_ARRAYS.store(resolve(module, "glDrawArrays") as usize, Ordering::Relaxed);
+        REAL_GL_ENABLE_CLIENT_STATE.store(
+            resolve(module, "glEnableClientState") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_DISABLE_CLIENT_STATE.store(
+            resolve(module, "glDisableClientState") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_DEPTH_MASK.store(resolve(module, "glDepthMask") as usize, Ordering::Relaxed);
+        REAL_GL_PUSH_ATTRIB.store(resolve(module, "glPushAttrib") as usize, Ordering::Relaxed);
+        REAL_GL_POP_ATTRIB.store(resolve(module, "glPopAttrib") as usize, Ordering::Relaxed);
+        REAL_GL_PUSH_CLIENT_ATTRIB.store(
+            resolve(module, "glPushClientAttrib") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_POP_CLIENT_ATTRIB.store(
+            resolve(module, "glPopClientAttrib") as usize,
+            Ordering::Relaxed,
+        );
+        REAL_GL_PIXEL_STORE_I.store(resolve(module, "glPixelStorei") as usize, Ordering::Relaxed);
+        // Profiled entry points. They are intercepted by Rust bodies that
+        // call these real pointers, so resolve all of them even when the
+        // user never runs a profiler mod.
+        for (slot, name) in [
+            (&REAL_GL_CALL_LIST, "glCallList"),
+            (&REAL_GL_BIND_TEXTURE, "glBindTexture"),
+            (&REAL_GL_BEGIN, "glBegin"),
+            (&REAL_GL_END, "glEnd"),
+            (&REAL_GL_DRAW_ELEMENTS, "glDrawElements"),
+            (&REAL_GL_TEX_IMAGE2D, "glTexImage2D"),
+            (&REAL_GL_TEX_SUB_IMAGE2D, "glTexSubImage2D"),
+            (&REAL_GL_NEW_LIST, "glNewList"),
+            (&REAL_GL_END_LIST, "glEndList"),
+            (&REAL_GL_GEN_LISTS, "glGenLists"),
+            (&REAL_GL_DELETE_LISTS, "glDeleteLists"),
+            (&REAL_GL_CALL_LISTS, "glCallLists"),
+        ] {
+            slot.store(resolve(module, name) as usize, Ordering::Relaxed);
+        }
+
+        REAL_MODULE.store(module as usize, Ordering::Release);
+        FORWARD_TABLE.store(Box::into_raw(table).cast(), Ordering::Release);
+        true
     }
 }
 
 pub unsafe fn init(instance: Hmodule) {
     unsafe {
         LOG_T0.store(GetTickCount(), Ordering::Relaxed);
-        INSTANCE_BASE.store(instance as usize, Ordering::Relaxed);
-        let veh = AddVectoredExceptionHandler(1, crash_handler);
+        let mut pinned = core::ptr::null_mut();
+        // The watcher, callbacks, CBT hooks and exception handler live until exit.
+        if GetModuleHandleExW(0x5, instance.cast(), &mut pinned) == 0 {
+            // PIN | FROM_ADDRESS
+            log(&format!(
+                "init: could not pin the process-lifetime proxy: {}",
+                GetLastError()
+            ));
+            return;
+        }
+        let veh = install_exception_logger();
         let pid = GetCurrentProcessId();
         let cfg = load_config();
         let _ = CONFIG.set(cfg.clone());
@@ -107,6 +310,10 @@ pub unsafe fn init(instance: Hmodule) {
             );
         }
 
+        if cfg.hook_cbt {
+            install_cbt_hooks();
+        }
+
         // Drag-and-drop install: a PROFILES.zip next to the game is extracted
         // into profiles/ before discovery runs.
         install_profiles();
@@ -125,7 +332,7 @@ pub unsafe fn init(instance: Hmodule) {
             profile::Selection::Matched(p) => {
                 log(&format!(
                     "profile: exe={} build={} status={} image=0x{:x} ts=0x{:x} base=0x{base:x} \
-                 slots={} canvas={} scene={} rtti={} los={} source={}",
+                 slots={} canvas={} scene={} rtti={} los={} terrain={} range={} source={}",
                     p.exe,
                     p.build,
                     p.status.tag(),
@@ -136,6 +343,8 @@ pub unsafe fn init(instance: Hmodule) {
                     p.scene.is_some() as u8,
                     p.rtti.len(),
                     p.los.is_some() as u8,
+                    p.terrain.is_some() as u8,
+                    p.range.is_some() as u8,
                     p.source
                 ));
                 validate_profile_slots();
@@ -148,6 +357,7 @@ pub unsafe fn init(instance: Hmodule) {
             }
         }
         if cfg.profile_dump {
+            diagnose_slots(base, image_size);
             let (text_rva, text_size) = module_text_range(base).unwrap_or((0, 0));
             log(&format!(
                 "profile dump: module base=0x{base:x} image=0x{image_size:x} ts=0x{:x} \
@@ -187,172 +397,6 @@ pub unsafe fn init(instance: Hmodule) {
             }
         }
 
-        match real_dll_path() {
-            Some(path) => {
-                let module = LoadLibraryExW(
-                    wide(&path.to_string_lossy()).as_ptr(),
-                    core::ptr::null_mut(),
-                    LOAD_WITH_ALTERED_SEARCH_PATH,
-                );
-                if module.is_null() || module == instance {
-                    log(&format!(
-                        "[pid {pid}] FATAL: LoadLibraryExW({}) returned {:p} (self={instance:p})",
-                        path.display(),
-                        module
-                    ));
-                    return;
-                }
-                REAL_MODULE.store(module as usize, Ordering::Relaxed);
-
-                // Fill in the forwarded function pointers
-                let mut resolved = 0usize;
-                let mut missing: Vec<&str> = Vec::new();
-                for (i, name) in FORWARDED_NAMES.iter().enumerate() {
-                    let addr = resolve(module, name);
-                    if addr.is_null() {
-                        missing.push(name);
-                    } else {
-                        // Write to the individual static via REAL_POINTERS
-                        core::ptr::write(REAL_POINTERS[i], addr as usize);
-                        resolved += 1;
-                    }
-                }
-
-                REAL_WGL_CREATE_CONTEXT.store(
-                    resolve(module, "wglCreateContext") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_WGL_MAKE_CURRENT.store(
-                    resolve(module, "wglMakeCurrent") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_WGL_DELETE_CONTEXT.store(
-                    resolve(module, "wglDeleteContext") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_WGL_GET_PROC_ADDRESS.store(
-                    resolve(module, "wglGetProcAddress") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_WGL_SWAP_BUFFERS.store(
-                    resolve(module, "wglSwapBuffers") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_WGL_SHARE_LISTS
-                    .store(resolve(module, "wglShareLists") as usize, Ordering::Relaxed);
-                REAL_WGL_GET_CURRENT_CONTEXT.store(
-                    resolve(module, "wglGetCurrentContext") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_WGL_GET_CURRENT_DC.store(
-                    resolve(module, "wglGetCurrentDC") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_GL_GET_STRING
-                    .store(resolve(module, "glGetString") as usize, Ordering::Relaxed);
-                REAL_GL_VIEWPORT.store(resolve(module, "glViewport") as usize, Ordering::Relaxed);
-                REAL_GL_SCISSOR.store(resolve(module, "glScissor") as usize, Ordering::Relaxed);
-                REAL_GL_RASTER_POS2I
-                    .store(resolve(module, "glRasterPos2i") as usize, Ordering::Relaxed);
-                REAL_GL_RASTER_POS3F
-                    .store(resolve(module, "glRasterPos3f") as usize, Ordering::Relaxed);
-                REAL_GL_READ_PIXELS
-                    .store(resolve(module, "glReadPixels") as usize, Ordering::Relaxed);
-                REAL_GL_COPY_TEX_SUB_IMAGE2D.store(
-                    resolve(module, "glCopyTexSubImage2D") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_GL_COPY_TEX_IMAGE2D.store(
-                    resolve(module, "glCopyTexImage2D") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_GL_DRAW_PIXELS
-                    .store(resolve(module, "glDrawPixels") as usize, Ordering::Relaxed);
-                REAL_GL_WINDOW_POS
-                    .store(resolve(module, "glWindowPos2i") as usize, Ordering::Relaxed);
-                REAL_GL_DISABLE.store(resolve(module, "glDisable") as usize, Ordering::Relaxed);
-                REAL_GL_ENABLE.store(resolve(module, "glEnable") as usize, Ordering::Relaxed);
-                // OpenGL 1.1 entry points live in opengl32.dll's export table and
-                // wglGetProcAddress returns NULL for them, so they have to come from
-                // GetProcAddress like every other forwarded function.
-                REAL_GL_GET_BOOLEANV
-                    .store(resolve(module, "glGetBooleanv") as usize, Ordering::Relaxed);
-                REAL_GL_GET_FLOATV
-                    .store(resolve(module, "glGetFloatv") as usize, Ordering::Relaxed);
-                REAL_GL_GET_INTEGERV
-                    .store(resolve(module, "glGetIntegerv") as usize, Ordering::Relaxed);
-                // Triangle overlay (cokelos and future mods).
-                REAL_GL_BLEND_FUNC
-                    .store(resolve(module, "glBlendFunc") as usize, Ordering::Relaxed);
-                REAL_GL_MATRIX_MODE
-                    .store(resolve(module, "glMatrixMode") as usize, Ordering::Relaxed);
-                REAL_GL_LOAD_IDENTITY.store(
-                    resolve(module, "glLoadIdentity") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_GL_PUSH_MATRIX
-                    .store(resolve(module, "glPushMatrix") as usize, Ordering::Relaxed);
-                REAL_GL_POP_MATRIX
-                    .store(resolve(module, "glPopMatrix") as usize, Ordering::Relaxed);
-                REAL_GL_ORTHO.store(resolve(module, "glOrtho") as usize, Ordering::Relaxed);
-                REAL_GL_VERTEX_POINTER.store(
-                    resolve(module, "glVertexPointer") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_GL_COLOR_POINTER.store(
-                    resolve(module, "glColorPointer") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_GL_DRAW_ARRAYS
-                    .store(resolve(module, "glDrawArrays") as usize, Ordering::Relaxed);
-                REAL_GL_ENABLE_CLIENT_STATE.store(
-                    resolve(module, "glEnableClientState") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_GL_DISABLE_CLIENT_STATE.store(
-                    resolve(module, "glDisableClientState") as usize,
-                    Ordering::Relaxed,
-                );
-                REAL_GL_DEPTH_MASK
-                    .store(resolve(module, "glDepthMask") as usize, Ordering::Relaxed);
-                REAL_GL_BIND_BUFFER
-                    .store(resolve(module, "glBindBuffer") as usize, Ordering::Relaxed);
-                REAL_GL_PUSH_ATTRIB
-                    .store(resolve(module, "glPushAttrib") as usize, Ordering::Relaxed);
-                REAL_GL_POP_ATTRIB
-                    .store(resolve(module, "glPopAttrib") as usize, Ordering::Relaxed);
-                // Profiled entry points. They are intercepted by Rust bodies that
-                // call these real pointers, so resolve all of them even when the
-                // user never runs a profiler mod.
-                for (slot, name) in [
-                    (&REAL_GL_CALL_LIST, "glCallList"),
-                    (&REAL_GL_BIND_TEXTURE, "glBindTexture"),
-                    (&REAL_GL_BEGIN, "glBegin"),
-                    (&REAL_GL_END, "glEnd"),
-                    (&REAL_GL_DRAW_ELEMENTS, "glDrawElements"),
-                    (&REAL_GL_TEX_IMAGE2D, "glTexImage2D"),
-                    (&REAL_GL_TEX_SUB_IMAGE2D, "glTexSubImage2D"),
-                    (&REAL_GL_NEW_LIST, "glNewList"),
-                    (&REAL_GL_END_LIST, "glEndList"),
-                    (&REAL_GL_GEN_LISTS, "glGenLists"),
-                    (&REAL_GL_DELETE_LISTS, "glDeleteLists"),
-                    (&REAL_GL_CALL_LISTS, "glCallLists"),
-                ] {
-                    slot.store(resolve(module, name) as usize, Ordering::Relaxed);
-                }
-
-                log(&format!(
-                    "[pid {pid}] {PRODUCT_NAME} {VERSION} loaded: real={} forwarded={resolved}/{} missing={:?}",
-                    path.display(),
-                    FORWARDED_COUNT,
-                    missing
-                ));
-            }
-            None => log(&format!(
-                "[pid {pid}] FATAL: cannot prepare a real opengl32 copy"
-            )),
-        }
-
         log(&format!(
             "[pid {pid}] config: logical={logical_w}x{logical_h} fullscreen={} window_scale={}% fullscreen_inset={} edge={} stretch={} \
 fix_alt_tab={} limit_fps={} vsync={:?} priority={} affinity=0x{:x} scale_fixes={} promote_scene={} hook_slots={} canvas_patch={} stale_viewport_fix={} scene_rect_fix={} hook_cbt={} hook_window={} hook_wndproc={} hook_mode={}",
@@ -378,13 +422,6 @@ fix_alt_tab={} limit_fps={} vsync={:?} priority={} affinity=0x{:x} scale_fixes={
             cfg.hook_mode
         ));
 
-        // Sleep() is only accurate to the system timer resolution; the engine never
-        // raises it, so a 60 fps cap would drift without this.
-        if cfg.limit_fps > 0 {
-            let old = timeBeginPeriod(1);
-            log(&format!("timer resolution raised to 1 ms (was {old})"));
-        }
-
         // Install the slot hooks immediately; the watcher keeps them installed in
         // case the unpacker overwrites the slots later during startup.
         if cfg.hook_slots {
@@ -392,7 +429,7 @@ fix_alt_tab={} limit_fps={} vsync={:?} priority={} affinity=0x{:x} scale_fixes={
         }
 
         let mut tid = 0u32;
-        CreateThread(
+        let worker = CreateThread(
             core::ptr::null_mut(),
             256 * 1024,
             watcher_thread,
@@ -400,7 +437,15 @@ fix_alt_tab={} limit_fps={} vsync={:?} priority={} affinity=0x{:x} scale_fixes={
             0,
             &mut tid,
         );
-        log(&format!("[pid {pid}] watcher thread {tid}"));
+        if worker.is_null() {
+            log(&format!(
+                "[pid {pid}] watcher thread failed: {}",
+                GetLastError()
+            ));
+        } else {
+            CloseHandle(worker);
+            log(&format!("[pid {pid}] watcher thread {tid}"));
+        }
         log("[init] done");
     }
 }

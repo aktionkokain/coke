@@ -29,10 +29,7 @@ pub static REAL_GL_RASTER_POS3F: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_READ_PIXELS: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_COPY_TEX_SUB_IMAGE2D: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_COPY_TEX_IMAGE2D: AtomicUsize = AtomicUsize::new(0);
-pub static REAL_BIND_FRAMEBUFFER: AtomicUsize = AtomicUsize::new(0);
-pub static REAL_SWAP_INTERVAL: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_DRAW_PIXELS: AtomicUsize = AtomicUsize::new(0);
-pub static REAL_GL_WINDOW_POS: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_DISABLE: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_ENABLE: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_BLEND_FUNC: AtomicUsize = AtomicUsize::new(0);
@@ -43,13 +40,16 @@ pub static REAL_GL_POP_MATRIX: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_ORTHO: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_VERTEX_POINTER: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_COLOR_POINTER: AtomicUsize = AtomicUsize::new(0);
+pub static REAL_GL_COLOR_3F: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_DRAW_ARRAYS: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_ENABLE_CLIENT_STATE: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_DISABLE_CLIENT_STATE: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_DEPTH_MASK: AtomicUsize = AtomicUsize::new(0);
-pub static REAL_GL_BIND_BUFFER: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_PUSH_ATTRIB: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_POP_ATTRIB: AtomicUsize = AtomicUsize::new(0);
+pub static REAL_GL_PUSH_CLIENT_ATTRIB: AtomicUsize = AtomicUsize::new(0);
+pub static REAL_GL_POP_CLIENT_ATTRIB: AtomicUsize = AtomicUsize::new(0);
+pub static REAL_GL_PIXEL_STORE_I: AtomicUsize = AtomicUsize::new(0);
 // Profiled calls (see src/perf.rs). Intercepted so the proxy can count them.
 pub static REAL_GL_CALL_LIST: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GL_BIND_TEXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -79,15 +79,15 @@ pub static REAL_SHOW_WINDOW: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_SHOW_WINDOW_ASYNC: AtomicUsize = AtomicUsize::new(0);
 
 pub static REAL_MODULE: AtomicUsize = AtomicUsize::new(0);
+pub static WINDOW_GENERATION: AtomicU32 = AtomicU32::new(0);
+pub static SCENE_GENERATION: AtomicU32 = AtomicU32::new(0);
 pub static MAIN_WINDOW: AtomicUsize = AtomicUsize::new(0);
-pub static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 /// A build profile matched the running image: engine writes are allowed.
 /// Read-only features (RTTI, window discovery) work without it.
 pub static PROFILE_OK: AtomicU32 = AtomicU32::new(0);
 /// Per-slot result of the slot-content check, one bit per configured slot.
 /// A slot is only rewritten when its current value still points at the real
 /// user32 function.
-pub static SLOT_OK_MASK: AtomicU32 = AtomicU32::new(0);
 /// Set while a mod owns the native camera input boundary.
 pub static CAMERA_INPUT_CAPTURE: AtomicU32 = AtomicU32::new(0);
 pub static CAMERA_FREECAM_ACTIVE: AtomicU32 = AtomicU32::new(0);
@@ -152,23 +152,13 @@ pub fn set_camera_rmb_held(held: bool) {
     }
 }
 
-pub const SLOT_BIT_CLOSE_WINDOW: u32 = 1 << 0;
-pub const SLOT_BIT_GET_SYSTEM_METRICS: u32 = 1 << 1;
-pub const SLOT_BIT_CHANGE_DISPLAY: u32 = 1 << 2;
-pub const SLOT_BIT_GET_CURSOR_POS: u32 = 1 << 3;
-
 /// Was the image identified as a known build? Gate for engine *writes*.
 pub fn profile_ok() -> bool {
-    PROFILE_OK.load(Ordering::Relaxed) != 0
+    PROFILE_OK.load(Ordering::Acquire) != 0
 }
 /// Set while the user is deliberately minimising the window; the ShowWindow
 /// hook lets that one through and keeps suppressing the engine's minimises.
 pub static ALLOW_MINIMIZE: AtomicU32 = AtomicU32::new(0);
-pub static SCAN_TICKS: AtomicU32 = AtomicU32::new(0);
-pub static LAST_SCAN_MS: AtomicU32 = AtomicU32::new(0);
-pub static SCAN_SHOW: AtomicU32 = AtomicU32::new(0);
-pub static SCAN_SHOW_ASYNC: AtomicU32 = AtomicU32::new(0);
-pub static SCAN_ASYNC_KEY: AtomicU32 = AtomicU32::new(0);
 pub static MAXIMIZE_LOGGED: AtomicU32 = AtomicU32::new(0);
 pub static IDENTITY_LOGGED: AtomicU32 = AtomicU32::new(0);
 pub static CLOSE_LOGGED: AtomicU32 = AtomicU32::new(0);

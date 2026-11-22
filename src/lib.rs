@@ -67,11 +67,12 @@ include!(concat!(env!("OUT_DIR"), "/thunks.rs"));
 pub extern "system" fn DllMain(instance: Hmodule, reason: u32, _reserved: usize) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
+            INSTANCE_BASE.store(instance as usize, core::sync::atomic::Ordering::Release);
             DisableThreadLibraryCalls(instance);
             let mut tid = 0u32;
             // Do not perform filesystem work or load another DLL under the
             // loader lock. The bootstrap thread starts once DllMain returns.
-            CreateThread(
+            let worker = CreateThread(
                 core::ptr::null_mut(),
                 256 * 1024,
                 init_thread,
@@ -79,6 +80,10 @@ pub extern "system" fn DllMain(instance: Hmodule, reason: u32, _reserved: usize)
                 0,
                 &mut tid,
             );
+            if worker.is_null() {
+                return 0;
+            }
+            CloseHandle(worker);
         }
     }
     1

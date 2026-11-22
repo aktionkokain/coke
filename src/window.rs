@@ -456,10 +456,10 @@ pub unsafe fn class_is_cm(hwnd: Hwnd) -> bool {
 
 pub unsafe fn is_game_window(hwnd: Hwnd) -> bool {
     unsafe {
-        if hwnd.is_null() {
+        if !owns_window(hwnd) {
             return false;
         }
-        if MAIN_WINDOW.load(Ordering::Relaxed) == hwnd as usize {
+        if current_window(hwnd) {
             return true;
         }
         class_is_cm(hwnd)
@@ -653,6 +653,8 @@ unsafe fn resize_hit(hwnd: Hwnd, lparam: isize) -> Option<isize> {
     }
 }
 
+const ORIGINAL_PROC_PROPERTY: *const c_char = c"Coke.OriginalWndProc".as_ptr();
+
 pub unsafe extern "system" fn custom_wndproc(
     hwnd: Hwnd,
     msg: u32,
@@ -660,7 +662,7 @@ pub unsafe extern "system" fn custom_wndproc(
     lparam: isize,
 ) -> isize {
     unsafe {
-        let original = ORIGINAL_WNDPROC.load(Ordering::Relaxed);
+        let original = GetPropA(hwnd, ORIGINAL_PROC_PROPERTY) as isize;
         let call_original = |hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize| -> isize {
             if original != 0 && is_executable_ptr(original as usize) {
                 CallWindowProcW(original, hwnd, msg, wparam, lparam)
@@ -669,6 +671,14 @@ pub unsafe extern "system" fn custom_wndproc(
             }
         };
 
+        if msg == 0x0082 {
+            // WM_NCDESTROY
+            RemovePropA(hwnd, ORIGINAL_PROC_PROPERTY);
+            return call_original(hwnd, msg, wparam, lparam);
+        }
+        if !current_window(hwnd) {
+            return call_original(hwnd, msg, wparam, lparam);
+        }
         if crate::range::handle_message(msg, wparam, lparam) {
             return 0;
         }
@@ -910,6 +920,9 @@ pub fn is_wndproc_thunk(value: isize) -> bool {
 
 pub unsafe fn install_wndproc_hook(hwnd: Hwnd) {
     unsafe {
+        if !current_window(hwnd) {
+            return;
+        }
         let ours = custom_wndproc as *const () as isize;
         let current = GetWindowLongW(hwnd, GWLP_WNDPROC) as isize;
         if current == ours {
@@ -935,12 +948,29 @@ pub unsafe fn install_wndproc_hook(hwnd: Hwnd) {
             }
             return;
         }
-        ORIGINAL_WNDPROC.store(current, Ordering::Relaxed);
-        SetWindowLongW(hwnd, GWLP_WNDPROC, ours as i32);
-        let n = GetWindowLongW(hwnd, GWLP_WNDPROC) as isize;
-        log(&format!(
-            "wndproc hooked (previous=0x{current:x}, now=0x{n:x})"
-        ));
+        let previous_property = GetPropA(hwnd, ORIGINAL_PROC_PROPERTY);
+        if SetPropA(hwnd, ORIGINAL_PROC_PROPERTY, current as Handle) == 0 {
+            log(&format!(
+                "wndproc: cannot store previous procedure: {}",
+                GetLastError()
+            ));
+            return;
+        }
+        let previous = SetWindowLongW(hwnd, GWLP_WNDPROC, ours as i32) as isize;
+        if previous == 0 {
+            let error = GetLastError();
+            if previous_property.is_null() {
+                RemovePropA(hwnd, ORIGINAL_PROC_PROPERTY);
+            } else {
+                SetPropA(hwnd, ORIGINAL_PROC_PROPERTY, previous_property);
+            }
+            log(&format!("wndproc: subclass failed: {error}"));
+            return;
+        }
+        if previous != current {
+            SetPropA(hwnd, ORIGINAL_PROC_PROPERTY, previous as Handle);
+        }
+        log(&format!("wndproc hooked (previous=0x{previous:x})"));
     }
 }
 
@@ -998,6 +1028,9 @@ pub unsafe fn kick_repaint(hwnd: Hwnd) {
 
 pub unsafe fn apply_window_mode(hwnd: Hwnd, fullscreen: bool) {
     unsafe {
+        if !current_window(hwnd) {
+            return;
+        }
         let (lw, lh) = logical_size();
         if lw <= 0 || lh <= 0 {
             return;

@@ -69,6 +69,21 @@ pub struct MonitorInfo {
 }
 
 #[repr(C)]
+#[derive(Default)]
+pub struct SystemInfo {
+    pub architecture: u32,
+    pub page_size: u32,
+    pub min_address: usize,
+    pub max_address: usize,
+    pub active_processor_mask: usize,
+    pub processor_count: u32,
+    pub processor_type: u32,
+    pub allocation_granularity: u32,
+    pub processor_level: u16,
+    pub processor_revision: u16,
+}
+
+#[repr(C)]
 pub struct MemBasicInfo {
     pub base_address: *mut c_void,
     pub allocation_base: *mut c_void,
@@ -222,6 +237,7 @@ pub const VK_L: i32 = 0x4c;
 pub const VK_ESCAPE: i32 = 0x1b;
 
 pub const DLL_PROCESS_ATTACH: u32 = 1;
+pub const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 pub const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 pub const PAGE_READWRITE: u32 = 0x04;
@@ -290,7 +306,9 @@ unsafe extern "system" {
     pub fn ClientToScreen(hwnd: Hwnd, pt: *mut Point) -> i32;
     pub fn GetAsyncKeyState(key: i32) -> i16;
     pub fn GetKeyState(key: i32) -> i16;
-    pub fn FindWindowA(class: *const c_char, title: *const c_char) -> Hwnd;
+    pub fn GetPropA(hwnd: Hwnd, name: *const c_char) -> Handle;
+    pub fn SetPropA(hwnd: Hwnd, name: *const c_char, value: Handle) -> i32;
+    pub fn RemovePropA(hwnd: Hwnd, name: *const c_char) -> Handle;
     pub fn GetClassNameA(hwnd: Hwnd, buf: *mut c_char, len: i32) -> i32;
     pub fn GetSystemMetrics(index: i32) -> i32;
     pub fn SystemParametersInfoW(action: u32, param: u32, data: *mut c_void, win_ini: u32) -> i32;
@@ -324,6 +342,7 @@ unsafe extern "system" {
         module: Hmodule,
         thread: u32,
     ) -> Handle;
+    pub fn UnhookWindowsHookEx(hook: Handle) -> i32;
     pub fn CallNextHookEx(hook: Handle, code: i32, wparam: usize, lparam: isize) -> isize;
     pub fn InvalidateRect(hwnd: Hwnd, rect: *const Rect, erase: i32) -> i32;
     pub fn RegisterClassW(class: *const WndClassW) -> u16;
@@ -444,11 +463,6 @@ unsafe extern "system" {
     pub fn WinHttpCloseHandle(handle: Handle) -> i32;
 }
 
-#[link(name = "winmm")]
-unsafe extern "system" {
-    pub fn timeBeginPeriod(period: u32) -> u32;
-}
-
 #[link(name = "kernel32")]
 unsafe extern "system" {
     pub fn LoadLibraryW(name: *const u16) -> Hmodule;
@@ -460,14 +474,30 @@ unsafe extern "system" {
     pub fn FindNextFileW(handle: Handle, data: *mut Win32FindDataW) -> i32;
     pub fn FindClose(handle: Handle) -> i32;
     pub fn GetModuleHandleW(name: *const u16) -> Hmodule;
+    pub fn GetModuleHandleExW(flags: u32, name_or_address: *const u16, module: *mut Hmodule)
+    -> i32;
+    pub fn CreateWaitableTimerExW(
+        attributes: *mut c_void,
+        name: *const u16,
+        flags: u32,
+        access: u32,
+    ) -> Handle;
+    pub fn SetWaitableTimer(
+        timer: Handle,
+        due: *const i64,
+        period: i32,
+        completion: usize,
+        arg: *mut c_void,
+        resume: i32,
+    ) -> i32;
+    pub fn WaitForSingleObject(handle: Handle, timeout: u32) -> u32;
     pub fn GetModuleFileNameW(module: Hmodule, buf: *mut u16, len: u32) -> u32;
+    pub fn GetSystemInfo(info: *mut SystemInfo);
     pub fn GetSystemDirectoryW(buf: *mut u16, len: u32) -> u32;
     pub fn GetCurrentProcessId() -> u32;
     pub fn GetCurrentThreadId() -> u32;
     pub fn GetCurrentProcess() -> Handle;
     pub fn GetTickCount() -> u32;
-    pub fn CopyFileW(from: *const u16, to: *const u16, fail_if_exists: i32) -> i32;
-    pub fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, len: u32) -> u32;
     pub fn CreateDirectoryW(path: *const u16, sa: *mut c_void) -> i32;
     pub fn DisableThreadLibraryCalls(module: Hmodule) -> i32;
     pub fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
@@ -511,6 +541,13 @@ unsafe extern "system" {
     pub fn GetCurrentThread() -> Handle;
     pub fn SetThreadAffinityMask(thread: Handle, mask: usize) -> usize;
     pub fn CloseHandle(handle: Handle) -> i32;
+    pub fn WriteFile(
+        file: Handle,
+        buffer: *const c_void,
+        bytes: u32,
+        written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
     pub fn TerminateProcess(process: Handle, exit_code: u32) -> !;
     pub fn ExitProcess(exit_code: u32) -> !;
     pub fn AddVectoredExceptionHandler(

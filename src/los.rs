@@ -21,7 +21,7 @@
 use crate::*;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// `cokelos` engine anchors come from the profile's optional `[los]` block.
 /// Absence means the overlay is unavailable on this build; it is not an error.
@@ -202,17 +202,24 @@ pub unsafe fn world() -> Option<usize> {
 static TERRAIN_MAP: AtomicUsize = AtomicUsize::new(0);
 static TERRAIN_NEXT: AtomicU32 = AtomicU32::new(0);
 
-unsafe fn terrain_from(map: usize) -> Option<Terrain> {
+unsafe fn terrain_from_layout(
+    map: usize,
+    height_off: usize,
+    grid_w_off: usize,
+    grid_h_off: usize,
+    world_w_off: usize,
+    world_h_off: usize,
+    vt_action_map: u32,
+    vt_terrain_map: u32,
+) -> Option<Terrain> {
     unsafe {
         if map < 0x10000 || !committed(map, 0x100) {
             return None;
         }
-        let l = profile::los()?;
         let vt = vtable_of(map).unwrap_or(0);
-        if vt != profile_vt(l.vt_action_map) && vt != profile_vt(l.vt_terrain_map) {
+        if vt != profile_vt(vt_action_map) && vt != profile_vt(vt_terrain_map) {
             return None;
         }
-        let (height_off, grid_w_off, grid_h_off, world_w_off, world_h_off) = los_offsets();
         let (Some(grid_w), Some(grid_h), Some(world_w), Some(world_h), Some(height_ptr)) = (
             rd_u32(map + grid_w_off),
             rd_u32(map + grid_h_off),
@@ -251,8 +258,92 @@ unsafe fn terrain_from(map: usize) -> Option<Terrain> {
     }
 }
 
+unsafe fn terrain_from(map: usize) -> Option<Terrain> {
+    unsafe {
+        let l = profile::los()?;
+        let (height_off, grid_w_off, grid_h_off, world_w_off, world_h_off) = los_offsets();
+        terrain_from_layout(
+            map,
+            height_off,
+            grid_w_off,
+            grid_h_off,
+            world_w_off,
+            world_h_off,
+            l.vt_action_map,
+            l.vt_terrain_map,
+        )
+    }
+}
+
+/// Resolve the heightfield for CokeRange without requiring a complete CokeLOS
+/// profile. Each candidate is checked against its build's RTTI vtables and
+/// plausible dimensions before it is exposed to the range engine.
+pub unsafe fn range_terrain() -> Option<Terrain> {
+    unsafe {
+        let t = profile::terrain_anchors()?;
+        let candidates = t.map_globals.iter().filter_map(|rva| {
+            profile_addr(*rva)
+                .and_then(|slot| rd_u32(slot))
+                .map(|map| map as usize)
+        });
+        for map in candidates {
+            if let Some(found) = terrain_from_layout(
+                map,
+                t.height_off as usize,
+                t.grid_w_off as usize,
+                t.grid_h_off as usize,
+                t.world_w_off as usize,
+                t.world_h_off as usize,
+                t.vt_action_map,
+                t.vt_terrain_map,
+            ) {
+                TERRAIN_MAP.store(map, Ordering::Relaxed);
+                return Some(found);
+            }
+        }
+        if t.world_ptr != 0
+            && let Some(world_slot) = profile_addr(t.world_ptr)
+            && let Some(world) = rd_u32(world_slot).map(|p| p as usize)
+            && world > 0x10000
+            && t.action_map_off != 0
+            && let Some(map) = rd_u32(world + t.action_map_off as usize).map(|p| p as usize)
+            && let Some(found) = terrain_from_layout(
+                map,
+                t.height_off as usize,
+                t.grid_w_off as usize,
+                t.grid_h_off as usize,
+                t.world_w_off as usize,
+                t.world_h_off as usize,
+                t.vt_action_map,
+                t.vt_terrain_map,
+            )
+        {
+            TERRAIN_MAP.store(map, Ordering::Relaxed);
+            return Some(found);
+        }
+        None
+    }
+}
+
+pub unsafe fn range_world() -> Option<usize> {
+    unsafe {
+        let rva = profile::terrain_anchors()?.world_ptr;
+        let world = rd_u32(profile_addr(rva)?)? as usize;
+        (world >= 0x10000 && committed(world, 0x8a4)).then_some(world)
+    }
+}
+
 pub unsafe fn terrain() -> Option<Terrain> {
     unsafe {
+        // A standalone terrain profile is intentionally sufficient for the
+        // stable host terrain ABI; it does not grant CokeLOS camera/occlusion
+        // capabilities. Fall through to the legacy LOS discovery path for
+        // builds that still use its richer anchors.
+        if profile::terrain_anchors().is_some()
+            && let Some(t) = range_terrain()
+        {
+            return Some(t);
+        }
         let l = profile::los()?;
         // The global anchors are authoritative and change per battle; re-read them
         // before trusting the cache so a new map cannot be served stale data.
@@ -333,25 +424,32 @@ pub unsafe fn terrain() -> Option<Terrain> {
 
 /// Bilinear terrain height at a world position (map units, usually metres).
 pub unsafe fn terrain_height(t: &Terrain, x: f32, z: f32) -> f32 {
-    unsafe {
-        let fx = (x / t.world_w * (t.grid_w - 1) as f32).clamp(0.0, (t.grid_w - 1) as f32);
-        let fz = (z / t.world_h * (t.grid_h - 1) as f32).clamp(0.0, (t.grid_h - 1) as f32);
-        let x0 = fx.floor() as i32;
-        let z0 = fz.floor() as i32;
-        let x1 = (x0 + 1).min(t.grid_w - 1);
-        let z1 = (z0 + 1).min(t.grid_h - 1);
-        let tx = fx - x0 as f32;
-        let tz = fz - z0 as f32;
-        let w = t.grid_w as usize;
-        let at = |gx: i32, gz: i32| -> f32 {
-            rd_f32(t.height_ptr + (gz as usize * w + gx as usize) * 4).unwrap_or(0.0)
-        };
-        let h00 = at(x0, z0);
-        let h10 = at(x1, z0);
-        let h01 = at(x0, z1);
-        let h11 = at(x1, z1);
-        (h00 * (1.0 - tx) + h10 * tx) * (1.0 - tz) + (h01 * (1.0 - tx) + h11 * tx) * tz
-    }
+    interpolate_terrain_height(t, x, z, |index| unsafe {
+        rd_f32(t.height_ptr + index * 4).unwrap_or(0.0)
+    })
+}
+
+pub(crate) fn interpolate_terrain_height(
+    t: &Terrain,
+    x: f32,
+    z: f32,
+    height: impl Fn(usize) -> f32,
+) -> f32 {
+    let fx = (x / t.world_w * (t.grid_w - 1) as f32).clamp(0.0, (t.grid_w - 1) as f32);
+    let fz = (z / t.world_h * (t.grid_h - 1) as f32).clamp(0.0, (t.grid_h - 1) as f32);
+    let x0 = fx.floor() as i32;
+    let z0 = fz.floor() as i32;
+    let x1 = (x0 + 1).min(t.grid_w - 1);
+    let z1 = (z0 + 1).min(t.grid_h - 1);
+    let tx = fx - x0 as f32;
+    let tz = fz - z0 as f32;
+    let w = t.grid_w as usize;
+    let at = |gx: i32, gz: i32| height(gz as usize * w + gx as usize);
+    let h00 = at(x0, z0);
+    let h10 = at(x1, z0);
+    let h01 = at(x0, z1);
+    let h11 = at(x1, z1);
+    (h00 * (1.0 - tx) + h10 * tx) * (1.0 - tz) + (h01 * (1.0 - tx) + h11 * tx) * tz
 }
 
 /// Copy a sub-rectangle of the height array into `out` (row-major, `nx*nz`).
@@ -562,33 +660,32 @@ pub unsafe fn los_scan_map(
 
         // Cache the full heightfield: it is static for a battle and 24 MB of
         // per-row reads are not something to repeat at scan rate.
-        let mut guard = HEIGHT_CACHE.lock().ok()?;
-        let cache = guard.get_or_insert_with(|| HeightCache {
-            map: 0,
-            w: 0,
-            h: 0,
-            data: Vec::new(),
-        });
-        if cache.map != t.map
-            || cache.w != t.grid_w
-            || cache.h != t.grid_h
-            || cache.data.len() != (t.grid_w as usize) * (t.grid_h as usize)
-        {
-            cache.map = t.map;
-            cache.w = t.grid_w;
-            cache.h = t.grid_h;
-            cache.data.clear();
-            if !load_heights(&t, &mut cache.data) {
-                *guard = None;
-                return None;
+        let generation = SCENE_GENERATION.load(Ordering::Relaxed);
+        let key = (generation, t.map, t.height_ptr, t.grid_w, t.grid_h);
+        let data = {
+            let mut cache = HEIGHT_CACHE.lock().ok()?;
+            if let Some(entry) = cache.as_ref().filter(|entry| entry.key == key) {
+                Arc::clone(&entry.data)
+            } else {
+                let mut heights = Vec::new();
+                if !load_heights(&t, &mut heights)
+                    || SCENE_GENERATION.load(Ordering::Relaxed) != generation
+                {
+                    return None;
+                }
+                let data: Arc<[f32]> = heights.into();
+                *cache = Some(HeightCache {
+                    key,
+                    data: Arc::clone(&data),
+                });
+                data
             }
-        }
+        };
 
         let gw = t.grid_w as usize;
         let gh = t.grid_h as usize;
         let inv_w = 1.0 / t.world_w.max(1.0);
         let inv_h = 1.0 / t.world_h.max(1.0);
-        let data = &cache.data;
         let sample = |x: f32, z: f32| -> f32 {
             let gx = ((x * inv_w * (t.grid_w - 1) as f32).round() as i32).clamp(0, t.grid_w - 1)
                 as usize;
@@ -697,7 +794,7 @@ pub unsafe fn los_scan_map(
                 heights[(j * nx + i) as usize] = sample(i as f32 * cell, j as f32 * cell);
             }
         }
-        Some((nx, nz))
+        (SCENE_GENERATION.load(Ordering::Relaxed) == generation).then_some((nx, nz))
     }
 }
 
@@ -705,10 +802,8 @@ static HEIGHT_CACHE: Mutex<Option<HeightCache>> = Mutex::new(None);
 static GROW_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 struct HeightCache {
-    map: usize,
-    w: i32,
-    h: i32,
-    data: Vec<f32>,
+    key: (u32, usize, usize, i32, i32),
+    data: Arc<[f32]>,
 }
 
 unsafe fn load_heights(t: &Terrain, out: &mut Vec<f32>) -> bool {
@@ -929,19 +1024,22 @@ unsafe fn controller_camera_with_ptr() -> Option<(usize, Camera)> {
 /// Write the live camera's view fields after re-validating its vtable and
 /// numeric contents. This is the only host-side mutation exposed to `/coke/`
 /// mods; callers never receive the raw pointer or build-specific offsets.
-pub unsafe fn camera_apply_command(cmd: &coke_host::CokeCameraCommand) -> bool {
+pub(crate) fn camera_command_valid(cmd: &CokeCameraCommand) -> bool {
+    !(!cmd.pan_right.is_finite()
+        || !cmd.pan_forward.is_finite()
+        || !cmd.yaw.is_finite()
+        || !cmd.pitch.is_finite()
+        || !cmd.zoom.is_finite()
+        || cmd.pan_right.abs() > 50.0
+        || cmd.pan_forward.abs() > 50.0
+        || cmd.yaw.abs() > 0.5
+        || cmd.pitch.abs() > 0.5
+        || cmd.zoom.abs() > 50.0)
+}
+
+pub unsafe fn camera_apply_command(cmd: &CokeCameraCommand) -> bool {
     unsafe {
-        if !cmd.pan_right.is_finite()
-            || !cmd.pan_forward.is_finite()
-            || !cmd.yaw.is_finite()
-            || !cmd.pitch.is_finite()
-            || !cmd.zoom.is_finite()
-            || cmd.pan_right.abs() > 50.0
-            || cmd.pan_forward.abs() > 50.0
-            || cmd.yaw.abs() > 0.5
-            || cmd.pitch.abs() > 0.5
-            || cmd.zoom.abs() > 50.0
-        {
+        if !camera_command_valid(cmd) {
             return camera_reject("command bounds");
         }
         let Some((ptr, mut cam)) = controller_camera_with_ptr() else {

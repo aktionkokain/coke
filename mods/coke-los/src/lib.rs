@@ -22,7 +22,7 @@
 #![allow(clippy::missing_safety_doc, clippy::type_complexity)]
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------- host ABI
 
@@ -178,6 +178,7 @@ const MODE_PROBE: u8 = 1;
 static MODE: AtomicU8 = AtomicU8::new(MODE_OFF);
 /// Set when the fan must be (re)computed: once on activation, not per frame.
 static NEEDS_SCAN: AtomicU32 = AtomicU32::new(0);
+static SCAN_SEQUENCE: AtomicU32 = AtomicU32::new(1);
 static TRY_MS: AtomicU32 = AtomicU32::new(0);
 static DUMP_REQUESTED: AtomicU32 = AtomicU32::new(0);
 #[derive(Default)]
@@ -188,14 +189,17 @@ struct Mesh {
     tris: Vec<WorldVertex>,
 }
 
-impl Mesh {
-    fn clear(&mut self) {
-        self.lines.clear();
-        self.tris.clear();
-    }
+#[derive(Default)]
+struct ScanBuffers {
+    vis: Vec<u8>,
+    heights: Vec<f32>,
 }
 
-static MESH: OnceLock<Mutex<Mesh>> = OnceLock::new();
+static SCAN_BUFFERS: Mutex<ScanBuffers> = Mutex::new(ScanBuffers {
+    vis: Vec::new(),
+    heights: Vec::new(),
+});
+static MESH: Mutex<Option<Arc<Mesh>>> = Mutex::new(None);
 static ORIGIN: OnceLock<Mutex<(f32, f32, f32)>> = OnceLock::new();
 static SCAN_FAILED: AtomicU32 = AtomicU32::new(0);
 static FAN_BUILT: AtomicU32 = AtomicU32::new(0);
@@ -213,10 +217,6 @@ struct Status {
 
 static STATUS: OnceLock<Mutex<Status>> = OnceLock::new();
 static FLASH_UNTIL: AtomicU32 = AtomicU32::new(0);
-
-fn mesh() -> &'static Mutex<Mesh> {
-    MESH.get_or_init(|| Mutex::new(Mesh::default()))
-}
 
 fn fan_origin() -> &'static Mutex<(f32, f32, f32)> {
     ORIGIN.get_or_init(|| Mutex::new((0.0, 0.0, 0.0)))
@@ -336,7 +336,10 @@ unsafe fn poll_hotkeys() {
             };
             MODE.store(next, Ordering::Relaxed);
             if next == MODE_PROBE {
-                NEEDS_SCAN.store(1, Ordering::Relaxed);
+                let request = SCAN_SEQUENCE.fetch_add(1, Ordering::Relaxed).max(1);
+                NEEDS_SCAN.store(request, Ordering::Release);
+            } else {
+                NEEDS_SCAN.store(0, Ordering::Release);
             }
             log(&format!(
                 "cokelos: probe {}",
@@ -369,7 +372,7 @@ unsafe fn poll_hotkeys() {
 
 // ------------------------------------------------------------- fan builder
 
-unsafe fn rebuild_fan(origin: (f32, f32, f32), mode: u8, label: &str, rgb: u32) {
+unsafe fn rebuild_fan(origin: (f32, f32, f32), mode: u8, request: u32, label: &str, rgb: u32) {
     unsafe {
         let Some(h) = host() else { return };
         let Some(scan) = h.los_scan_map else {
@@ -391,8 +394,12 @@ unsafe fn rebuild_fan(origin: (f32, f32, f32), mode: u8, label: &str, rgb: u32) 
             set_status("LOS SCAN FAILED - MAP TOO LARGE", COL_ERR);
             return;
         }
-        let mut vis = vec![0u8; n];
-        let mut heights = vec![0f32; n];
+        let Ok(mut buffers) = SCAN_BUFFERS.lock() else {
+            return;
+        };
+        let ScanBuffers { vis, heights } = &mut *buffers;
+        vis.resize(n, 0);
+        heights.resize(n, 0.0);
         let (mut ox, mut oz) = (0i32, 0i32);
         let scan_t0 = now_ms();
         let ok = scan(
@@ -631,6 +638,16 @@ unsafe fn rebuild_fan(origin: (f32, f32, f32), mode: u8, label: &str, rgb: u32) 
             }
         }
 
+        let mut current = CokeTerrain::default();
+        if NEEDS_SCAN.load(Ordering::Acquire) != request
+            || MODE.load(Ordering::Relaxed) != mode
+            || h.terrain.map(|f| f(&mut current)).unwrap_or(0) == 0
+            || (t.map, t.heights, t.grid_w, t.grid_h)
+                != (current.map, current.heights, current.grid_w, current.grid_h)
+        {
+            return;
+        }
+
         if FAN_BUILT.swap(1, Ordering::Relaxed) == 0 {
             log(&format!(
                 "cokelos: fan {label} at ({:.0},{:.0}) {} line verts, {visible_cells}/{total_cells} visible, scan {}ms",
@@ -661,13 +678,8 @@ unsafe fn rebuild_fan(origin: (f32, f32, f32), mode: u8, label: &str, rgb: u32) 
         if let Ok(mut o) = fan_origin().lock() {
             *o = origin;
         }
-        // Blocking lock on purpose: the render thread holds this while it submits
-        // the previous mesh. `try_lock` here silently dropped a freshly scanned
-        // mesh whenever a frame was mid-draw, and `NEEDS_SCAN` was already being
-        // cleared, so the fan could stay invisible until the mode was toggled.
-        if let Ok(mut m) = mesh().lock() {
-            m.lines = lines;
-            m.tris = tris;
+        if let Ok(mut mesh) = MESH.lock() {
+            *mesh = Some(Arc::new(Mesh { lines, tris }));
         }
     }
 }
@@ -767,7 +779,7 @@ unsafe fn cursor_origin(h: &CokeHost) -> Option<(f32, f32, f32)> {
     }
 }
 
-/// Runs on the host's pinned worker thread (~100 Hz). Only scans on demand.
+/// Runs on the host's worker thread. Only scans on demand.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn coke_tick() {
     unsafe {
@@ -780,8 +792,8 @@ pub unsafe extern "system" fn coke_tick() {
         }
         let mode = MODE.load(Ordering::Relaxed);
         if mode == MODE_OFF {
-            if let Ok(mut m) = mesh().try_lock() {
-                m.clear();
+            if let Ok(mut mesh) = MESH.try_lock() {
+                *mesh = None;
             }
             // Fully off: no mesh and no persistent status line (a hotkey flash still
             // shows for ~1.6 s when toggling).
@@ -793,7 +805,8 @@ pub unsafe extern "system" fn coke_tick() {
         // Compute ONCE per activation. The mesh is cached and just re-submitted by
         // `coke_frame`; no periodic rescans and no cursor tracking, which is what
         // made the overlay churn and flicker.
-        if NEEDS_SCAN.load(Ordering::Relaxed) == 0 {
+        let request = NEEDS_SCAN.load(Ordering::Acquire);
+        if request == 0 {
             return;
         }
         let now = now_ms();
@@ -813,8 +826,8 @@ pub unsafe extern "system" fn coke_tick() {
             .terrain_height
             .map(|f| f(origin.0, origin.1))
             .unwrap_or(origin.2);
-        rebuild_fan((origin.0, origin.1, ground), mode, "PROBE", COL_OK);
-        NEEDS_SCAN.store(0, Ordering::Relaxed);
+        rebuild_fan((origin.0, origin.1, ground), mode, request, "PROBE", COL_OK);
+        let _ = NEEDS_SCAN.compare_exchange(request, 0, Ordering::AcqRel, Ordering::Relaxed);
     }
 }
 
@@ -829,7 +842,7 @@ pub unsafe extern "system" fn coke_frame(_w: i32, _h: i32, _fps: f32) {
         let Some(h) = host() else { return };
 
         if mode != MODE_OFF
-            && let Ok(m) = mesh().lock()
+            && let Some(m) = MESH.lock().ok().and_then(|mesh| mesh.clone())
         {
             if !m.lines.is_empty()
                 && let Some(f) = h.draw_world_lines

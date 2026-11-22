@@ -109,7 +109,12 @@ unsafe extern "system" {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
 
 fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok()?.parent().map(PathBuf::from)
@@ -169,8 +174,7 @@ fn load_config() -> Config {
             }
             "freecam_noclip" => cfg.freecam_noclip = yes,
             "zoom_reference_fov" => {
-                cfg.zoom_reference_fov =
-                    number.unwrap_or(cfg.zoom_reference_fov).clamp(5.0, 120.0)
+                cfg.zoom_reference_fov = number.unwrap_or(cfg.zoom_reference_fov).clamp(5.0, 120.0)
             }
             "zoom_drag_floor" => {
                 cfg.zoom_drag_floor = number.unwrap_or(cfg.zoom_drag_floor).clamp(0.02, 0.8)
@@ -217,11 +221,17 @@ fn drag_bounds() -> Option<(Point, Rect)> {
         if GetClientRect(hwnd, &mut r) == 0 || r.right <= r.left || r.bottom <= r.top {
             return None;
         }
-        let mut p = Point { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
+        let mut p = Point {
+            x: (r.left + r.right) / 2,
+            y: (r.top + r.bottom) / 2,
+        };
         if ClientToScreen(hwnd, &mut p) == 0 {
             return None;
         }
-        let mut top_left = Point { x: r.left, y: r.top };
+        let mut top_left = Point {
+            x: r.left,
+            y: r.top,
+        };
         if ClientToScreen(hwnd, &mut top_left) == 0 {
             return None;
         }
@@ -364,27 +374,27 @@ unsafe fn tick() {
         if freecam {
             let dir = live_camera.dir;
             let up = live_camera.up;
-            let dir_len =
-                (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+            let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
             let right3 = [
                 dir[1] * up[2] - dir[2] * up[1],
                 dir[2] * up[0] - dir[0] * up[2],
                 dir[0] * up[1] - dir[1] * up[0],
             ];
             let right_len =
-                (right3[0] * right3[0] + right3[1] * right3[1] + right3[2] * right3[2])
-                    .sqrt();
+                (right3[0] * right3[0] + right3[1] * right3[1] + right3[2] * right3[2]).sqrt();
             if dir_len > 1.0e-5 && right_len > 1.0e-5 {
                 let vertical = (key_down(VK_R) as i32 - key_down(VK_F) as i32) as f32;
                 let mut movement = [
                     input_forward * dir[0] / dir_len + input_right * right3[0] / right_len,
                     input_forward * dir[1] / dir_len + input_right * right3[1] / right_len,
-                    input_forward * dir[2] / dir_len + input_right * right3[2] / right_len
+                    input_forward * dir[2] / dir_len
+                        + input_right * right3[2] / right_len
                         + vertical,
                 ];
-                let length =
-                    (movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2])
-                        .sqrt();
+                let length = (movement[0] * movement[0]
+                    + movement[1] * movement[1]
+                    + movement[2] * movement[2])
+                    .sqrt();
                 if length > 1.0 {
                     movement.iter_mut().for_each(|v| *v /= length);
                 }
@@ -409,10 +419,8 @@ unsafe fn tick() {
         }
         // Orbit in the mod path. The engine hook masks Q/E so these keys can
         // never also invoke the native elevation bindings.
-        cmd.yaw = (key_down(VK_E) as i32 - key_down(VK_Q) as i32) as f32
-            * 1.4
-            * speed_multiplier
-            * dt;
+        cmd.yaw =
+            (key_down(VK_E) as i32 - key_down(VK_Q) as i32) as f32 * 1.4 * speed_multiplier * dt;
         let rmb = key_down(VK_RBUTTON);
         let mmb = key_down(VK_MBUTTON);
         let close_camera_factor =
@@ -440,10 +448,8 @@ unsafe fn tick() {
                     dir[2] * up[0] - dir[0] * up[2],
                     dir[0] * up[1] - dir[1] * up[0],
                 ];
-                let right_len = (right3[0] * right3[0]
-                    + right3[1] * right3[1]
-                    + right3[2] * right3[2])
-                    .sqrt();
+                let right_len =
+                    (right3[0] * right3[0] + right3[1] * right3[1] + right3[2] * right3[2]).sqrt();
                 if fwd_len > 1.0e-5 && right_len > 1.0e-5 {
                     let forward = [dir[0] / fwd_len, dir[1] / fwd_len];
                     let ground_right = [forward[1], -forward[0]];
@@ -511,7 +517,11 @@ unsafe fn tick() {
         cmd.yaw = cmd.yaw.clamp(-0.5, 0.5);
         cmd.pitch = cmd.pitch.clamp(-0.5, 0.5);
         cmd.zoom = cmd.zoom.clamp(-50.0, 50.0);
-        if (cmd.pan_right != 0.0 || cmd.pan_forward != 0.0 || cmd.yaw != 0.0 || cmd.pitch != 0.0 || cmd.zoom != 0.0)
+        if (cmd.pan_right != 0.0
+            || cmd.pan_forward != 0.0
+            || cmd.yaw != 0.0
+            || cmd.pitch != 0.0
+            || cmd.zoom != 0.0)
             && now.wrapping_sub(INPUT_TRACE_AT.load(Ordering::Relaxed)) >= 1000
         {
             INPUT_TRACE_AT.store(now, Ordering::Relaxed);
@@ -547,7 +557,10 @@ pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
             .register_hotkey
             .is_some_and(|register| register(vk, Some(toggle_freecam)) != 0);
         if registered {
-            log(&format!("camera: free-camera toggle F{} registered", cfg.freecam_fkey));
+            log(&format!(
+                "camera: free-camera toggle F{} registered",
+                cfg.freecam_fkey
+            ));
         } else {
             log("camera: free-camera toggle registration failed");
         }

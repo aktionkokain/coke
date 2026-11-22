@@ -1,8 +1,9 @@
 //! WH_CBT create-window hook: gives the engine its final window size at creation.
 
 use crate::*;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::ffi::c_void;
+use std::sync::Mutex;
 
 // ---- code ----
 // ------------------------------------------------------------------ CBT hook
@@ -33,26 +34,15 @@ pub struct CbtCreateWnd {
     pub insert_after: Hwnd,
 }
 
-pub const MAX_HOOKED: usize = 32;
-pub static HOOKED_TIDS: [AtomicU32; MAX_HOOKED] = [const { AtomicU32::new(0) }; MAX_HOOKED];
-pub static HOOKED_COUNT: AtomicUsize = AtomicUsize::new(0);
+const MAX_HOOKED: usize = 32;
 
-/// The engine registers its window class as "CM Black Sea", either as an ANSI
-/// or as a UTF-16 string.
-pub fn class_is_cm_name(p: *const c_void) -> bool {
-    if p.is_null() || (p as usize) < 0x1_0000 {
-        return false; // class atom, not a string
-    }
-    const NAME: &[u8] = b"CM Black Sea";
-    unsafe {
-        let a = core::slice::from_raw_parts(p as *const u8, NAME.len());
-        if a == NAME {
-            return true;
-        }
-        let w = core::slice::from_raw_parts(p as *const u16, NAME.len());
-        w.iter().zip(NAME.iter()).all(|(c, b)| *c == *b as u16)
-    }
+struct ThreadHook {
+    id: u32,
+    thread: usize,
+    hook: usize,
 }
+
+static THREAD_HOOKS: Mutex<Vec<ThreadHook>> = Mutex::new(Vec::new());
 
 /// Framed window rectangle (outer size) used for the initial mode.
 pub unsafe fn framed_window_geometry() -> (i32, i32, i32, i32) {
@@ -86,7 +76,8 @@ pub unsafe extern "system" fn cbt_proc(code: i32, wparam: usize, lparam: isize) 
                     && (*cs).style & WS_POPUP != 0
                     && (*cs).cx >= 800
                     && (*cs).cy >= 600
-                    && class_is_cm_name((*cs).class)
+                    && owns_window(wparam as Hwnd)
+                    && class_is_cm(wparam as Hwnd)
                 {
                     let (x, y, w, h) = framed_window_geometry();
                     let (old_style, old_cx, old_cy) = ((*cs).style, (*cs).cx, (*cs).cy);
@@ -111,28 +102,48 @@ pub unsafe extern "system" fn cbt_proc(code: i32, wparam: usize, lparam: isize) 
 
 pub unsafe fn hook_thread(tid: u32) {
     unsafe {
-        let n = HOOKED_COUNT.load(Ordering::Relaxed);
-        for i in 0..n {
-            if HOOKED_TIDS[i].load(Ordering::Relaxed) == tid {
-                return;
+        let Ok(mut hooks) = THREAD_HOOKS.lock() else {
+            return;
+        };
+        hooks.retain(|entry| {
+            if WaitForSingleObject(entry.thread as Handle, 0) == 0 {
+                UnhookWindowsHookEx(entry.hook as Handle);
+                CloseHandle(entry.thread as Handle);
+                false
+            } else {
+                true
             }
-        }
-        if n >= MAX_HOOKED {
+        });
+        if hooks.len() >= MAX_HOOKED || hooks.iter().any(|entry| entry.id == tid) {
             return;
         }
-        let h = SetWindowsHookExW(
+        let thread = OpenThread(0x0010_0000, 0, tid); // SYNCHRONIZE
+        if thread.is_null() {
+            return;
+        }
+        let hook = SetWindowsHookExW(
             WH_CBT,
             cbt_proc,
             INSTANCE_BASE.load(Ordering::Relaxed) as Hmodule,
             tid,
         );
-        if !h.is_null() {
-            HOOKED_TIDS[n].store(tid, Ordering::Relaxed);
-            HOOKED_COUNT.store(n + 1, Ordering::Relaxed);
+        if !hook.is_null() {
+            hooks.push(ThreadHook {
+                id: tid,
+                thread: thread as usize,
+                hook: hook as usize,
+            });
+            if config().verbose {
+                log(&format!("cbt: installed on thread {tid}"));
+            }
         } else {
+            let error = GetLastError();
+            CloseHandle(thread);
             static FAIL_LOGGED: AtomicU32 = AtomicU32::new(0);
             if FAIL_LOGGED.swap(1, Ordering::Relaxed) == 0 {
-                log(&format!("cbt: SetWindowsHookEx failed for thread {tid}"));
+                log(&format!(
+                    "cbt: SetWindowsHookEx failed for thread {tid}: {error}"
+                ));
             }
         }
     }

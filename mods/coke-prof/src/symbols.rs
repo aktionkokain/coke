@@ -1,5 +1,7 @@
 // @generated from analysis/decompiled function headers; addresses only.
 // Sorted by RVA (image base 0x00400000). No decompiled code is included.
+// The original analysis did not record the executable identity.
+pub const EXE_FINGERPRINT: Option<(u64, u64)> = None;
 pub static SYMBOLS: &[(u32, &str)] = &[
     (0x001000, "FUN_00401000"),
     (0x0011e0, "FUN_004011e0"),

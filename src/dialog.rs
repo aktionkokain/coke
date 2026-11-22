@@ -13,7 +13,7 @@
 use crate::*;
 use std::sync::OnceLock;
 
-const CLASS_NAME: &str = "CokePrompt";
+pub(crate) const CLASS_NAME: &str = "CokePrompt";
 
 struct PromptState {
     result: i32,

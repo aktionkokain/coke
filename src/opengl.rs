@@ -62,6 +62,44 @@ pub unsafe fn qpc_freq() -> u64 {
     }
 }
 
+struct PacingTimer(usize);
+
+impl Drop for PacingTimer {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { CloseHandle(self.0 as Handle) };
+        }
+    }
+}
+
+fn wait_frame_delay(ticks: u64, frequency: u64) {
+    if ticks == 0 {
+        return;
+    }
+    thread_local! {
+        static TIMER: PacingTimer = PacingTimer(unsafe {
+            CreateWaitableTimerExW(core::ptr::null_mut(), core::ptr::null(), 2, 0x100002)
+        } as usize);
+    }
+    let units = ticks.saturating_mul(10_000_000) / frequency;
+    if units == 0 {
+        return;
+    }
+    let waited = TIMER.with(|timer| unsafe {
+        let handle = timer.0 as Handle;
+        let due = -(units.min(i64::MAX as u64) as i64);
+        !handle.is_null()
+            && SetWaitableTimer(handle, &due, 0, 0, core::ptr::null_mut(), 0) != 0
+            && WaitForSingleObject(handle, u32::MAX) == 0
+    });
+    if !waited {
+        let milliseconds = (units / 10_000) as u32;
+        if milliseconds > 0 {
+            unsafe { Sleep(milliseconds) };
+        }
+    }
+}
+
 /// Returns true the first time a given rectangle is seen, and false for every
 /// repeat. The GL thread is the only caller, but the count is claimed with a
 /// compare-exchange so a stray second thread can never corrupt the table.
@@ -284,6 +322,7 @@ fn pack_rect(x: i32, y: i32, w: i32, h: i32) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glViewport(x: i32, y: i32, width: i32, height: i32) {
+    require_forwarding();
     let real = REAL_GL_VIEWPORT.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -335,6 +374,7 @@ pub extern "system" fn glViewport(x: i32, y: i32, width: i32, height: i32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glScissor(x: i32, y: i32, width: i32, height: i32) {
+    require_forwarding();
     let real = REAL_GL_SCISSOR.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -368,6 +408,7 @@ pub extern "system" fn glScissor(x: i32, y: i32, width: i32, height: i32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glRasterPos2i(x: i32, y: i32) {
+    require_forwarding();
     let real = REAL_GL_RASTER_POS2I.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -388,6 +429,7 @@ pub extern "system" fn glRasterPos2i(x: i32, y: i32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glRasterPos3f(x: f32, y: f32, z: f32) {
+    require_forwarding();
     let real = REAL_GL_RASTER_POS3F.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -419,6 +461,7 @@ pub extern "system" fn glReadPixels(
     ty: u32,
     pixels: *mut c_void,
 ) {
+    require_forwarding();
     let real = REAL_GL_READ_PIXELS.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -472,6 +515,7 @@ pub extern "system" fn glCopyTexSubImage2D(
     width: i32,
     height: i32,
 ) {
+    require_forwarding();
     let real = REAL_GL_COPY_TEX_SUB_IMAGE2D.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -509,6 +553,7 @@ pub extern "system" fn glCopyTexImage2D(
     height: i32,
     border: i32,
 ) {
+    require_forwarding();
     let real = REAL_GL_COPY_TEX_IMAGE2D.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -535,29 +580,133 @@ pub extern "system" fn glCopyTexImage2D(
     perf::copy_tex();
 }
 
-pub unsafe extern "system" fn hook_bind_framebuffer(target: u32, framebuffer: u32) {
-    unsafe {
-        match target {
-            GL_FRAMEBUFFER => {
-                DRAW_FBO.store(framebuffer, Ordering::Relaxed);
-                READ_FBO.store(framebuffer, Ordering::Relaxed);
-            }
-            GL_DRAW_FRAMEBUFFER => DRAW_FBO.store(framebuffer, Ordering::Relaxed),
-            GL_READ_FRAMEBUFFER => READ_FBO.store(framebuffer, Ordering::Relaxed),
-            _ => {}
+type BindFramebuffer = unsafe extern "system" fn(u32, u32);
+
+thread_local! {
+    static PIXEL_BUFFERS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static CONTEXT_PROCS: std::cell::RefCell<std::collections::HashMap<&'static [u8], usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub(crate) fn gl_proc(name: &'static [u8]) -> usize {
+    CONTEXT_PROCS.with(|cache| {
+        if let Some(&address) = cache.borrow().get(name) {
+            return address;
         }
-        // A non-zero bind means an offscreen pass: the engine is drawing a 3D
-        // scene. This is what the scene-viewport promotion keys off, so record when
-        // it last happened. (The comment above used to claim this was diagnostic.)
-        if framebuffer != 0 {
-            FBO_LAST_TICK.store(GetTickCount(), Ordering::Relaxed);
+        let resolver = REAL_WGL_GET_PROC_ADDRESS.load(Ordering::Relaxed);
+        if resolver == 0 || wglGetCurrentContext().is_null() {
+            return 0;
         }
-        let real = REAL_BIND_FRAMEBUFFER.load(Ordering::Relaxed);
-        if real != 0 {
-            let f: unsafe extern "system" fn(u32, u32) = core::mem::transmute(real);
-            f(target, framebuffer);
+        let resolve: unsafe extern "system" fn(*const c_char) -> *mut c_void =
+            unsafe { core::mem::transmute(resolver) };
+        let address = unsafe { resolve(name.as_ptr().cast()) } as usize;
+        let address = if valid_gl_proc(address) { address } else { 0 };
+        cache.borrow_mut().insert(name, address);
+        address
+    })
+}
+
+pub(crate) fn pixel_buffers_supported() -> bool {
+    PIXEL_BUFFERS.with(|cache| {
+        if let Some(value) = cache.get() {
+            return value;
         }
+        let get = REAL_GL_GET_STRING.load(Ordering::Relaxed);
+        if get == 0 {
+            return false;
+        }
+        let get: unsafe extern "system" fn(u32) -> *const c_char =
+            unsafe { core::mem::transmute(get) };
+        let version = unsafe { get(0x1f02) };
+        if version.is_null() {
+            return false;
+        }
+        let version = unsafe { std::ffi::CStr::from_ptr(version) }.to_bytes();
+        let recent = version.first().is_some_and(|&major| major > b'2')
+            || version
+                .get(..3)
+                .is_some_and(|v| v[0] == b'2' && v[1] == b'.' && v[2] >= b'1');
+        let supported = recent || {
+            let ext = unsafe { get(0x1f03) };
+            !ext.is_null()
+                && unsafe { std::ffi::CStr::from_ptr(ext) }
+                    .to_bytes()
+                    .split(|&b| b == b' ')
+                    .any(|ext| {
+                        ext == b"GL_ARB_pixel_buffer_object" || ext == b"GL_EXT_pixel_buffer_object"
+                    })
+        };
+        cache.set(Some(supported));
+        supported
+    })
+}
+
+pub(crate) fn gl_integer(parameter: u32) -> i32 {
+    let get = REAL_GL_GET_INTEGERV.load(Ordering::Relaxed);
+    let mut value = 0;
+    if get != 0 {
+        let get: unsafe extern "system" fn(u32, *mut i32) = unsafe { core::mem::transmute(get) };
+        unsafe { get(parameter, &mut value) };
     }
+    value
+}
+
+fn valid_gl_proc(address: usize) -> bool {
+    address > 3 && address != usize::MAX
+}
+
+pub(crate) fn framebuffer_proc() -> Option<(BindFramebuffer, u32)> {
+    let core = gl_proc(b"glBindFramebuffer\0");
+    if core != 0 {
+        return Some((
+            unsafe { core::mem::transmute::<usize, BindFramebuffer>(core) },
+            GL_DRAW_FRAMEBUFFER,
+        ));
+    }
+    let ext = gl_proc(b"glBindFramebufferEXT\0");
+    let target = if gl_proc(b"glBlitFramebufferEXT\0") != 0 {
+        GL_DRAW_FRAMEBUFFER
+    } else {
+        GL_FRAMEBUFFER
+    };
+    (ext != 0).then(|| {
+        (
+            unsafe { core::mem::transmute::<usize, BindFramebuffer>(ext) },
+            target,
+        )
+    })
+}
+
+fn tracked_framebuffer_bind(target: u32, framebuffer: u32, real: usize) {
+    if real == 0 {
+        return;
+    }
+    let f: BindFramebuffer = unsafe { core::mem::transmute(real) };
+    unsafe { f(target, framebuffer) };
+    match target {
+        GL_FRAMEBUFFER => {
+            DRAW_FBO.store(framebuffer, Ordering::Relaxed);
+            READ_FBO.store(framebuffer, Ordering::Relaxed);
+        }
+        GL_DRAW_FRAMEBUFFER => DRAW_FBO.store(framebuffer, Ordering::Relaxed),
+        GL_READ_FRAMEBUFFER => READ_FBO.store(framebuffer, Ordering::Relaxed),
+        _ => {}
+    }
+    if framebuffer != 0 {
+        FBO_LAST_TICK.store(unsafe { GetTickCount() }, Ordering::Relaxed);
+    }
+}
+
+unsafe extern "system" fn hook_bind_framebuffer(target: u32, framebuffer: u32) {
+    tracked_framebuffer_bind(target, framebuffer, gl_proc(b"glBindFramebuffer\0"));
+}
+
+unsafe extern "system" fn hook_bind_framebuffer_ext(target: u32, framebuffer: u32) {
+    tracked_framebuffer_bind(target, framebuffer, gl_proc(b"glBindFramebufferEXT\0"));
+}
+
+unsafe extern "system" fn hook_bind_framebuffer_arb(target: u32, framebuffer: u32) {
+    tracked_framebuffer_bind(target, framebuffer, gl_proc(b"glBindFramebufferARB\0"));
 }
 
 // ------------------------------------------------------------ profiled calls
@@ -568,6 +717,7 @@ pub unsafe extern "system" fn hook_bind_framebuffer(target: u32, framebuffer: u3
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glCallList(list: u32) {
+    require_forwarding();
     let real = REAL_GL_CALL_LIST.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -587,6 +737,7 @@ pub extern "system" fn glCallList(list: u32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glBindTexture(target: u32, texture: u32) {
+    require_forwarding();
     let real = REAL_GL_BIND_TEXTURE.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -606,6 +757,7 @@ pub extern "system" fn glBindTexture(target: u32, texture: u32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glBegin(mode: u32) {
+    require_forwarding();
     let real = REAL_GL_BEGIN.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -617,6 +769,7 @@ pub extern "system" fn glBegin(mode: u32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glEnd() {
+    require_forwarding();
     let real = REAL_GL_END.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -628,6 +781,7 @@ pub extern "system" fn glEnd() {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glPushMatrix() {
+    require_forwarding();
     let real = REAL_GL_PUSH_MATRIX.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -639,6 +793,7 @@ pub extern "system" fn glPushMatrix() {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glPopMatrix() {
+    require_forwarding();
     let real = REAL_GL_POP_MATRIX.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -650,6 +805,7 @@ pub extern "system" fn glPopMatrix() {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glDrawArrays(mode: u32, first: i32, count: i32) {
+    require_forwarding();
     let real = REAL_GL_DRAW_ARRAYS.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -661,6 +817,7 @@ pub extern "system" fn glDrawArrays(mode: u32, first: i32, count: i32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glDrawElements(mode: u32, count: i32, ty: u32, indices: *const c_void) {
+    require_forwarding();
     let real = REAL_GL_DRAW_ELEMENTS.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -683,6 +840,7 @@ pub extern "system" fn glTexImage2D(
     ty: u32,
     pixels: *const c_void,
 ) {
+    require_forwarding();
     let real = REAL_GL_TEX_IMAGE2D.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -714,6 +872,7 @@ pub extern "system" fn glTexSubImage2D(
     ty: u32,
     pixels: *const c_void,
 ) {
+    require_forwarding();
     let real = REAL_GL_TEX_SUB_IMAGE2D.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -735,6 +894,7 @@ pub extern "system" fn glTexSubImage2D(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glNewList(list: u32, mode: u32) {
+    require_forwarding();
     let real = REAL_GL_NEW_LIST.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -746,6 +906,7 @@ pub extern "system" fn glNewList(list: u32, mode: u32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glEndList() {
+    require_forwarding();
     let real = REAL_GL_END_LIST.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -756,6 +917,7 @@ pub extern "system" fn glEndList() {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glGenLists(range: i32) -> u32 {
+    require_forwarding();
     let real = REAL_GL_GEN_LISTS.load(Ordering::Relaxed);
     if real == 0 {
         return 0;
@@ -766,6 +928,7 @@ pub extern "system" fn glGenLists(range: i32) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glDeleteLists(list: u32, range: i32) {
+    require_forwarding();
     let real = REAL_GL_DELETE_LISTS.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -777,6 +940,7 @@ pub extern "system" fn glDeleteLists(list: u32, range: i32) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn glCallLists(n: i32, ty: u32, lists: *const c_void) {
+    require_forwarding();
     let real = REAL_GL_CALL_LISTS.load(Ordering::Relaxed);
     if real == 0 {
         return;
@@ -789,15 +953,30 @@ pub extern "system" fn glCallLists(n: i32, ty: u32, lists: *const c_void) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn wglCreateContext(hdc: Hdc) -> Hglrc {
+    require_forwarding();
     let f: unsafe extern "system" fn(Hdc) -> Hglrc =
         unsafe { core::mem::transmute(REAL_WGL_CREATE_CONTEXT.load(Ordering::Relaxed)) };
     unsafe { f(hdc) }
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn wglMakeCurrent(hdc: Hdc, hglrc: Hglrc) -> i32 {
+    require_forwarding();
     let f: unsafe extern "system" fn(Hdc, Hglrc) -> i32 =
         unsafe { core::mem::transmute(REAL_WGL_MAKE_CURRENT.load(Ordering::Relaxed)) };
+    let previous = wglGetCurrentContext();
+    if !previous.is_null() && previous != hglrc {
+        unsafe { crate::range::release_depth_context(previous) };
+    }
     let ok = unsafe { f(hdc, hglrc) };
+    if ok != 0 && previous != hglrc {
+        CONTEXT_PROCS.with(|cache| cache.borrow_mut().clear());
+        PIXEL_BUFFERS.with(|cache| cache.set(None));
+        if config().profile_dump {
+            log(&format!(
+                "profile dump: GL context {previous:p} -> {hglrc:p}"
+            ));
+        }
+    }
     // wglMakeCurrent(hdc, NULL) succeeds but leaves no context current, so no
     // context-dependent work may run in that case.
     if ok != 0 && !hglrc.is_null() {
@@ -805,8 +984,18 @@ pub extern "system" fn wglMakeCurrent(hdc: Hdc, hglrc: Hglrc) -> i32 {
             unsafe { log_gl_identity() };
         }
         // A fresh context starts with the default framebuffer bound.
-        DRAW_FBO.store(0, Ordering::Relaxed);
-        READ_FBO.store(0, Ordering::Relaxed);
+        let draw = if framebuffer_proc().is_some() {
+            gl_integer(0x8ca6) as u32
+        } else {
+            0
+        };
+        let read = if framebuffer_proc().is_some_and(|(_, target)| target == GL_DRAW_FRAMEBUFFER) {
+            gl_integer(0x8caa) as u32
+        } else {
+            draw
+        };
+        DRAW_FBO.store(draw, Ordering::Relaxed);
+        READ_FBO.store(read, Ordering::Relaxed);
         // The context captures its default viewport from the drawable at
         // creation time. If the window is going to end up a different size,
         // set that size now: the intro never calls glViewport again.
@@ -817,19 +1006,6 @@ pub extern "system" fn wglMakeCurrent(hdc: Hdc, hglrc: Hglrc) -> i32 {
             let f: unsafe extern "system" fn(i32, i32, i32, i32) =
                 unsafe { core::mem::transmute(vp) };
             unsafe { f(0, 0, tw, th) };
-        }
-        // glWindowPos2i is OpenGL 1.4: it is not in opengl32.dll's 1.1 export
-        // table and only resolves through wglGetProcAddress once a context is
-        // current. glGetBooleanv/glGetIntegerv are resolved in init().
-        unsafe {
-            if REAL_GL_WINDOW_POS.load(Ordering::Relaxed) == 0 {
-                let wgpa: unsafe extern "system" fn(*const c_char) -> *mut c_void =
-                    core::mem::transmute(REAL_WGL_GET_PROC_ADDRESS.load(Ordering::Relaxed));
-                let p = wgpa(b"glWindowPos2i\0".as_ptr() as *const c_char);
-                if !p.is_null() {
-                    REAL_GL_WINDOW_POS.store(p as usize, Ordering::Relaxed);
-                }
-            }
         }
         // Swap interval is per-context state, so re-assert it on every context
         // switch. The engine resolves wglSwapIntervalEXT through our
@@ -842,7 +1018,7 @@ pub extern "system" fn wglMakeCurrent(hdc: Hdc, hglrc: Hglrc) -> i32 {
 pub unsafe fn apply_vsync() {
     unsafe {
         let Some(want) = config().vsync else { return };
-        let real = REAL_SWAP_INTERVAL.load(Ordering::Relaxed);
+        let real = gl_proc(b"wglSwapIntervalEXT\0");
         if real == 0 {
             return;
         }
@@ -853,13 +1029,18 @@ pub unsafe fn apply_vsync() {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn wglDeleteContext(hglrc: Hglrc) -> i32 {
+    require_forwarding();
     let f: unsafe extern "system" fn(Hglrc) -> i32 =
         unsafe { core::mem::transmute(REAL_WGL_DELETE_CONTEXT.load(Ordering::Relaxed)) };
+    if !hglrc.is_null() && hglrc == wglGetCurrentContext() {
+        unsafe { crate::range::release_depth_context(hglrc) };
+    }
     unsafe { f(hglrc) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn wglShareLists(a: Hglrc, b: Hglrc) -> i32 {
+    require_forwarding();
     let f: unsafe extern "system" fn(Hglrc, Hglrc) -> i32 =
         unsafe { core::mem::transmute(REAL_WGL_SHARE_LISTS.load(Ordering::Relaxed)) };
     unsafe { f(a, b) }
@@ -867,6 +1048,7 @@ pub extern "system" fn wglShareLists(a: Hglrc, b: Hglrc) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn wglGetCurrentContext() -> Hglrc {
+    require_forwarding();
     let f: unsafe extern "system" fn() -> Hglrc =
         unsafe { core::mem::transmute(REAL_WGL_GET_CURRENT_CONTEXT.load(Ordering::Relaxed)) };
     unsafe { f() }
@@ -874,6 +1056,7 @@ pub extern "system" fn wglGetCurrentContext() -> Hglrc {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn wglGetCurrentDC() -> Hdc {
+    require_forwarding();
     let f: unsafe extern "system" fn() -> Hdc =
         unsafe { core::mem::transmute(REAL_WGL_GET_CURRENT_DC.load(Ordering::Relaxed)) };
     unsafe { f() }
@@ -889,7 +1072,7 @@ pub unsafe extern "system" fn hook_swap_interval(interval: i32) -> i32 {
             ));
         }
         let want = cfg.vsync.unwrap_or(interval);
-        let real = REAL_SWAP_INTERVAL.load(Ordering::Relaxed);
+        let real = gl_proc(b"wglSwapIntervalEXT\0");
         if real == 0 {
             return 0;
         }
@@ -900,29 +1083,37 @@ pub unsafe extern "system" fn hook_swap_interval(interval: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn wglGetProcAddress(name: *const c_char) -> *mut c_void {
+    require_forwarding();
     let f: unsafe extern "system" fn(*const c_char) -> *mut c_void =
         unsafe { core::mem::transmute(REAL_WGL_GET_PROC_ADDRESS.load(Ordering::Relaxed)) };
     let p = unsafe { f(name) };
-    if p.is_null() {
-        return p;
+    if !valid_gl_proc(p as usize) {
+        return core::ptr::null_mut();
     }
 
     // Always take the swap-interval entry point so the engine's own choice can
     // be logged, and overridden when the ini asks for it.
     if cstr_is(name, "wglSwapIntervalEXT") {
-        REAL_SWAP_INTERVAL.store(p as usize, Ordering::Relaxed);
         return hook_swap_interval as *const () as *mut c_void;
     }
     // Framebuffer binding decides whether a viewport is the window or an
     // offscreen pass, so the mapping hooks need to see it.
-    for alias in [
-        "glBindFramebuffer",
-        "glBindFramebufferEXT",
-        "glBindFramebufferARB",
+    for (alias, hook) in [
+        (
+            "glBindFramebuffer",
+            hook_bind_framebuffer as BindFramebuffer,
+        ),
+        (
+            "glBindFramebufferEXT",
+            hook_bind_framebuffer_ext as BindFramebuffer,
+        ),
+        (
+            "glBindFramebufferARB",
+            hook_bind_framebuffer_arb as BindFramebuffer,
+        ),
     ] {
         if cstr_is(name, alias) {
-            REAL_BIND_FRAMEBUFFER.store(p as usize, Ordering::Relaxed);
-            return hook_bind_framebuffer as *const () as *mut c_void;
+            return hook as *const () as *mut c_void;
         }
     }
     p
@@ -930,10 +1121,19 @@ pub extern "system" fn wglGetProcAddress(name: *const c_char) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn wglSwapBuffers(hdc: Hdc) -> i32 {
-    unsafe { crate::range::install_from_swap() };
-    let perf_entry = unsafe { perf::frame_begin() };
+    require_forwarding();
     let f: unsafe extern "system" fn(Hdc) -> i32 =
         unsafe { core::mem::transmute(REAL_WGL_SWAP_BUFFERS.load(Ordering::Relaxed)) };
+    if wglGetCurrentContext().is_null() {
+        return unsafe { f(hdc) };
+    }
+    static BATTLE_ACTIVE: AtomicU32 = AtomicU32::new(0);
+    let battle = in_game_scene() as u32;
+    if BATTLE_ACTIVE.swap(battle, Ordering::Relaxed) != battle {
+        SCENE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe { crate::range::install_from_swap() };
+    let perf_entry = unsafe { perf::frame_begin() };
 
     // If the window was resized since the last swap, the scissor rect the engine
     // set earlier this frame was scaled for the old size. Re-apply it now scaled
@@ -1035,6 +1235,7 @@ pub extern "system" fn wglSwapBuffers(hdc: Hdc) -> i32 {
         if pw > 0 && ph > 0 {
             coke_frame(pw, ph, FPS_CACHED.load(Ordering::Relaxed) as f32 / 10.0);
             coke_hud(pw, ph, FPS_CACHED.load(Ordering::Relaxed) as f32 / 10.0);
+            crate::range::draw_terrain_status(pw, ph);
         }
     }
 
@@ -1089,7 +1290,10 @@ pub extern "system" fn wglSwapBuffers(hdc: Hdc) -> i32 {
     }
 
     let result = unsafe { f(hdc) };
-    unsafe { perf::frame_end(perf_entry) };
+    unsafe {
+        perf::frame_end(perf_entry);
+        apply_queued_camera(battle != 0 && result != 0);
+    }
 
     unsafe {
         SWAP_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1124,7 +1328,7 @@ pub extern "system" fn wglSwapBuffers(hdc: Hdc) -> i32 {
         // uncapped otherwise (several hundred fps), burning CPU and GPU for
         // frames nobody sees.
         let limit = config().limit_fps;
-        if limit > 0 && config().vsync.is_none() && freq > 0 {
+        if limit > 0 && config().vsync.unwrap_or(0) <= 0 && freq > 0 {
             let period = freq / limit as u64;
             let now = qpc();
             let mut next = NEXT_FRAME.load(Ordering::Relaxed);
@@ -1137,10 +1341,7 @@ pub extern "system" fn wglSwapBuffers(hdc: Hdc) -> i32 {
             let target = next + period;
             NEXT_FRAME.store(target, Ordering::Relaxed);
             let delta = target.saturating_sub(now);
-            let ms = (delta * 1000 / freq) as u32;
-            if ms > 0 {
-                Sleep(ms);
-            }
+            wait_frame_delay(delta, freq);
         }
     }
     result

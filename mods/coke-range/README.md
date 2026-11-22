@@ -6,9 +6,29 @@ CokeRange provides a surface-to-surface rangefinder in Combat Mission Black Sea 
 - With a unit selected, use **Shift+T**. Bare **T** still starts the unit's Target order.
 - Press **H** while CokeRange is active to cycle the source height through **0.25 m**, **1 m**, **2 m**, and **3.5 m**. The lowest level is near ground height. CokeRange leaves **E** available to Coke Shot’s camera control. Press **T** or **Esc**, or right-click, to close CokeRange. Switching scenes, losing focus, or entering a native command clears the origin.
 
-CokeRange picks the nearest rendered surface under the cursor from the battle depth buffer, so house walls and roofs can become the source or endpoint instead of being skipped by a terrain-only ray. On startup it waits for a depth sample at the current cursor before fixing the source; if depth sampling is unavailable, it falls back to a terrain intersection. Depth readback uses pixel-buffer objects and non-blocking fences. Visibility classification is refreshed at most every 100 ms while the measured endpoint continues to follow the cursor. The source-height cycle adjusts the observer ray relative to the picked source surface. The game’s selected-unit verdict also depends on that unit’s weapons, crew, optics and spotting state. The native engine draws the ribbon and range label and supplies the visibility result.
+CokeRange reads the battle render target's depth at the cursor. Walls, roofs and depth-writing foliage can become the nearest surface. The origin uses the cursor position at the key press and waits for matching depth data. Pixels without a valid sample leave the preview waiting for a visible surface. Depth readback uses pixel-buffer objects and non-blocking fences. The range ribbon and visibility verdict use the native engine. A selected unit's Target verdict can also depend on its weapons, crew, optics and spotting state.
+
+On the verified Black Sea build, `Ctrl+Shift+T` toggles the experimental terrain LOS painter. It picks an observer surface under the cursor and classifies the map with the same native visibility routine as the range preview, including the engine's building and woodland blocking rules. The scan runs in small batches on the battle render thread. It samples at 16 m across the map and 8 m near the observer, with coarser cells on very large maps. Visible cells are green and blocked cells are red. Both nearby terrain and distant meshes use the resulting colors. Toggle again to clear the paint. Set `range_terrain_overlay_test=1` in `coke_config.ini` and restart to enable it.
 
 Build with `cargo build --release --locked` in this directory. Install `coke_range.dll` and `user_consent_coke_range.txt` under the game's `coke` directory. Update the host and the Black Sea profile together. The repository's packaging scripts include the submod.
+
+## Ribbon settings
+
+Edit `[range]` in `coke_config.ini` next to the game executable, then restart the game. These settings belong to the Coke host and apply to the shared range ribbon.
+
+| Setting | Default | Effect |
+| --- | ---: | --- |
+| `range_line_width` | `0.65` | Native ribbon width at close range. |
+| `range_line_scale_distance` | `100` | Distance in metres at which the ribbon starts to widen. Set to `0` for fixed width. |
+| `range_line_max_width` | `12` | Cap on scaled width. The cap has a minimum of the base width. |
+
+At twice the configured distance, the ribbon doubles in width until it reaches the cap. Width uses the distance from the camera to the farther endpoint, so clear and blocked portions of the same measurement stay the same thickness.
+
+## Terrain tint experiment
+
+On the verified Black Sea Steam x86 build, set `range_terrain_overlay_test=1` in the game's `coke_config.ini` and restart. Aim at the ground and press **Ctrl+Shift+Y** to place a red 24 m square. Aim again and press the chord to move it and turn it blue. A third press clears it. Each placement uses CokeRange's cursor ray and terrain intersection.
+
+The deployment compositor starts at RVA `0x003D05C0`. Its call at `0x003D0A2A` invokes the zone color writer at `0x003D03A0`. The writer multiplies the float RGB grid at `TerrainMap + 0x116F44`; the terrain renderer at RVA `0x00326AD0` draws that grid. The experiment saves the original RGB values and applies the deployment palette to the chosen area. Clearing the patch restores those values and invalidates the affected terrain color caches.
 
 ## Host integration
 

@@ -21,7 +21,7 @@ use core::ffi::{c_char, c_void};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -33,6 +33,8 @@ use coke_host::CokeHost;
 
 static HOST: OnceLock<CokeHost> = OnceLock::new();
 static HUD_MODE: AtomicU32 = AtomicU32::new(0);
+static LEGACY_KEYS: AtomicU32 = AtomicU32::new(0);
+static LEGACY_KEYS_DOWN: AtomicU32 = AtomicU32::new(0b11);
 
 const _: () = assert!(coke_host::COKE_HOST_V6_SIZE == 144);
 const _: () = assert!(core::mem::size_of::<CokeProfStats>() == 216);
@@ -64,49 +66,16 @@ fn fps() -> f32 {
 }
 
 fn module_base() -> u32 {
-    unsafe {
-        host()
-            .and_then(|h| h.module_base)
-            .map(|f| f())
-            .unwrap_or(0x0040_0000)
-    }
+    unsafe { host().and_then(|h| h.module_base).map(|f| f()).unwrap_or(0) }
 }
 
 // --------------------------------------------------------- proxy profiler
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct CokeProfStats {
-    pub version: u32,
-    pub size: u32,
-    pub frames: u64,
-    pub frame_ns: u64,
-    pub last_frame_ns: u64,
-    pub swap_calls: u64,
-    pub swap_ns: u64,
-    pub last_swap_ns: u64,
-    pub call_list: u64,
-    pub call_list_ns: u64,
-    pub bind_texture: u64,
-    pub bind_texture_ns: u64,
-    pub begin_end: u64,
-    pub push_pop: u64,
-    pub draw_arrays: u64,
-    pub draw_elements: u64,
-    pub vertices: u64,
-    pub tex_upload: u64,
-    pub tex_upload_bytes: u64,
-    pub read_pixels: u64,
-    pub read_pixels_ns: u64,
-    pub copy_tex: u64,
-    pub lists_new: u64,
-    pub lists_called: u64,
-    pub lists_deleted: u64,
-    pub cpu_frames: u64,
-    pub cpu_frame_ns: u64,
-    pub last_cpu_frame_ns: u64,
-}
+use coke_host::{COKE_PROF_VERSION, CokeProfStats};
 
+type ProfReadSizedFn = unsafe extern "system" fn(*mut CokeProfStats, u32) -> i32;
+type ProfVersionFn = unsafe extern "system" fn() -> u32;
+static PROF_READ_SIZED: AtomicUsize = AtomicUsize::new(0);
 type ProfReadFn = unsafe extern "system" fn(*mut CokeProfStats) -> i32;
 type ProfVoidFn = unsafe extern "system" fn();
 type ProfTimingFn = unsafe extern "system" fn(u32);
@@ -129,10 +98,20 @@ unsafe fn resolve_profiler() {
             return;
         }
         let name = |s: &str| CString::new(s).unwrap_or_default();
-        PROF_READ.store(
-            GetProcAddress(h, name("coke_prof_read").as_ptr()) as usize,
-            Ordering::Relaxed,
-        );
+        let version = GetProcAddress(h, name("coke_prof_version").as_ptr()) as usize;
+        if version != 0 {
+            let version: ProfVersionFn = core::mem::transmute(version);
+            if version() == COKE_PROF_VERSION {
+                PROF_READ_SIZED.store(
+                    GetProcAddress(h, name("coke_prof_read_sized").as_ptr()) as usize,
+                    Ordering::Relaxed,
+                );
+                PROF_READ.store(
+                    GetProcAddress(h, name("coke_prof_read").as_ptr()) as usize,
+                    Ordering::Relaxed,
+                );
+            }
+        }
         PROF_RESET.store(
             GetProcAddress(h, name("coke_prof_reset").as_ptr()) as usize,
             Ordering::Relaxed,
@@ -159,16 +138,21 @@ fn last_cpu_frame_ns() -> u64 {
 }
 
 fn read_stats(out: &mut CokeProfStats) -> bool {
-    let p = PROF_READ.load(Ordering::Relaxed);
-    if p == 0 {
-        return false;
-    }
-    let f: ProfReadFn = unsafe { core::mem::transmute(p) };
-    unsafe {
-        f(out) != 0
-            && out.version == 2
-            && out.size as usize == core::mem::size_of::<CokeProfStats>()
-    }
+    let size = size_of::<CokeProfStats>() as u32;
+    let sized = PROF_READ_SIZED.load(Ordering::Relaxed);
+    let legacy = PROF_READ.load(Ordering::Relaxed);
+    let ok = unsafe {
+        if sized != 0 {
+            let read: ProfReadSizedFn = core::mem::transmute(sized);
+            read(out, size)
+        } else if legacy != 0 {
+            let read: ProfReadFn = core::mem::transmute(legacy);
+            read(out)
+        } else {
+            0
+        }
+    };
+    ok != 0 && out.version == COKE_PROF_VERSION && out.size == size
 }
 
 unsafe fn reset_profiler() {
@@ -210,7 +194,7 @@ impl Default for Config {
         Self {
             enabled: true,
             hud: true,
-            sample: true,
+            sample: false,
             sample_hz: 25,
             interval_ms: 1000,
             top: 3,
@@ -430,7 +414,7 @@ static LAST_FRAME_QPC: AtomicU64 = AtomicU64::new(0);
 static GL_TID: AtomicU32 = AtomicU32::new(0);
 
 /// Frame times in microseconds, sorted for the percentiles.
-fn frame_percentiles() -> (f32, f32, f32, u32) {
+fn frame_percentiles() -> (f32, f32, f32, f32) {
     let mut v = Vec::with_capacity(RING);
     for slot in &FRAME_RING {
         let us = slot.load(Ordering::Relaxed);
@@ -439,7 +423,7 @@ fn frame_percentiles() -> (f32, f32, f32, u32) {
         }
     }
     if v.is_empty() {
-        return (0.0, 0.0, 0.0, 0);
+        return (0.0, 0.0, 0.0, 0.0);
     }
     v.sort_unstable();
     let avg = v.iter().sum::<u64>() as f32 / v.len() as f32 / 1000.0;
@@ -447,54 +431,113 @@ fn frame_percentiles() -> (f32, f32, f32, u32) {
         let i = (v.len().saturating_sub(1) * pct) / 100;
         v[i] as f32 / 1000.0
     };
-    (avg, p(95), p(99), v.len() as u32)
+    (avg, p(50), p(95), p(99))
 }
 
 // -------------------------------------------------------------- sampling
 
-static SAMPLES: OnceLock<Mutex<BTreeMap<u32, u32>>> = OnceLock::new();
-static LAST_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Location {
+    Game(u32),
+    GameUnmapped,
+    Other,
+}
 
-fn samples() -> &'static Mutex<BTreeMap<u32, u32>> {
+static SAMPLES: OnceLock<Mutex<BTreeMap<Location, u32>>> = OnceLock::new();
+static LAST_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
+static SUSPEND_TICKS: AtomicU64 = AtomicU64::new(0);
+static SUSPENSIONS: AtomicU32 = AtomicU32::new(0);
+static SAMPLE_FAILED: AtomicU32 = AtomicU32::new(0);
+static SYMBOL_BUILD_MATCH: OnceLock<bool> = OnceLock::new();
+
+fn samples() -> &'static Mutex<BTreeMap<Location, u32>> {
     SAMPLES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn matching_symbol_build() -> bool {
+    let Some((length, hash)) = symbols::EXE_FINGERPRINT else {
+        return false;
+    };
+    let Ok(mut exe) = std::env::current_exe().and_then(std::fs::File::open) else {
+        return false;
+    };
+    if !exe
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() == length)
+    {
+        return false;
+    }
+    let mut buf = [0; 16 * 1024];
+    let mut actual = 0xcbf29ce484222325u64;
+    loop {
+        match exe.read(&mut buf) {
+            Ok(0) => return actual == hash,
+            Ok(n) => {
+                for &byte in &buf[..n] {
+                    actual = (actual ^ byte as u64).wrapping_mul(0x100000001b3);
+                }
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 fn sample_gl_thread() {
     let tid = GL_TID.load(Ordering::Relaxed);
-    if tid == 0 || tid == unsafe { GetCurrentThreadId() } {
+    if tid == 0
+        || tid == unsafe { GetCurrentThreadId() }
+        || SAMPLE_FAILED.load(Ordering::Relaxed) != 0
+    {
         return;
     }
-    unsafe {
+    let ip = unsafe {
         let h = OpenThread(0x0002 | 0x0008, 0, tid); // SUSPEND_RESUME | GET_CONTEXT
         if h == 0 {
             return;
         }
+        let mut ctx = Context { buf: [0u8; 0x2cc] };
+        ctx.buf[0..4].copy_from_slice(&0x0001_0001u32.to_le_bytes()); // CONTEXT_CONTROL (i386)
+        let started = qpc();
         if SuspendThread(h) == u32::MAX {
             CloseHandle(h);
             return;
         }
-        let mut ctx = Context { buf: [0u8; 0x2cc] };
-        ctx.buf[0..4].copy_from_slice(&0x0001_0001u32.to_le_bytes()); // CONTEXT_CONTROL (i386)
-        if GetThreadContext(h, &mut ctx) != 0 {
-            let eip =
-                u32::from_le_bytes([ctx.buf[0xB8], ctx.buf[0xB9], ctx.buf[0xBA], ctx.buf[0xBB]]);
-            let base = module_base();
-            if eip >= base {
-                let rva = eip - base;
-                if let Ok(mut m) = samples().try_lock() {
-                    *m.entry(rva).or_insert(0) += 1;
-                }
-            }
-        }
-        ResumeThread(h);
+        let captured = GetThreadContext(h, &mut ctx) != 0;
+        let resumed = ResumeThread(h) != u32::MAX;
+        let elapsed = qpc().saturating_sub(started);
         CloseHandle(h);
+        if !resumed {
+            SAMPLE_FAILED.store(1, Ordering::Relaxed);
+            return;
+        }
+        SUSPEND_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+        SUSPENSIONS.fetch_add(1, Ordering::Relaxed);
+        if !captured {
+            return;
+        }
+        u32::from_le_bytes([ctx.buf[0xb8], ctx.buf[0xb9], ctx.buf[0xba], ctx.buf[0xbb]])
+    };
+    let base = module_base();
+    let size = unsafe { host().and_then(|h| h.module_size).map(|f| f()).unwrap_or(0) };
+    let location = match ip.checked_sub(base).filter(|&rva| base != 0 && rva < size) {
+        Some(rva) if *SYMBOL_BUILD_MATCH.get_or_init(matching_symbol_build) => Location::Game(rva),
+        Some(_) => Location::GameUnmapped,
+        None => Location::Other,
+    };
+    if let Ok(mut map) = samples().try_lock() {
+        *map.entry(location).or_insert(0) += 1;
     }
 }
 
-fn symbol_for(rva: u32) -> &'static str {
+fn symbol_for(location: Location) -> &'static str {
+    let rva = match location {
+        Location::Game(rva) => rva,
+        Location::GameUnmapped => return "game (unmapped)",
+        Location::Other => return "other/unknown module",
+    };
     match symbols::SYMBOLS.binary_search_by_key(&rva, |(a, _)| *a) {
         Ok(i) => symbols::SYMBOLS[i].1,
-        Err(0) => "?",
+        Err(0) => "game (unknown function)",
         Err(i) => symbols::SYMBOLS[i - 1].1,
     }
 }
@@ -612,7 +655,7 @@ fn write_csv(row: &str) {
 /// One snapshot interval. Builds the HUD lines and appends one CSV row.
 unsafe fn snapshot_interval() {
     let c = cfg();
-    let (avg, p95, p99, _n) = frame_percentiles();
+    let (avg, p50, p95, p99) = frame_percentiles();
     let (cpu_pct, threads, rows) = sample_threads();
 
     let mut st = CokeProfStats::default();
@@ -651,7 +694,7 @@ unsafe fn snapshot_interval() {
 
     // Top sampled functions. Percent is relative to the samples in this
     // interval, not to wall time, so it answers "where was the GL thread?".
-    let mut top: Vec<(u32, u32)> = Vec::new();
+    let mut top: Vec<(Location, u32)> = Vec::new();
     if c.sample
         && let Ok(mut m) = samples().try_lock()
     {
@@ -675,9 +718,10 @@ unsafe fn snapshot_interval() {
 
     let mut lines = Vec::new();
     lines.push(format!(
-        "PROF {:.1} fps  frame {:.1} / p95 {:.1} / p99 {:.1} ms  cpu {:.0}%  threads {}",
+        "PROF {:.1} fps  frame {:.1} / p50 {:.1} / p95 {:.1} / p99 {:.1} ms  cpu {:.0}%  threads {}",
         fps(),
         avg,
+        p50,
         p95,
         p99,
         cpu_pct,
@@ -715,8 +759,17 @@ unsafe fn snapshot_interval() {
             .join(" ");
         lines.push(format!("CPU {threads}"));
     }
-    if !top_str.is_empty() {
-        lines.push(format!("HOT {top_str}"));
+    if c.sample {
+        let ticks = SUSPEND_TICKS.swap(0, Ordering::Relaxed);
+        let count = SUSPENSIONS.swap(0, Ordering::Relaxed);
+        if SAMPLE_FAILED.load(Ordering::Relaxed) != 0 {
+            lines.push("HOT sampling stopped after ResumeThread failed".into());
+        } else if count > 0 {
+            let ms = ticks as f64 * 1000.0 / qpc_freq() as f64;
+            lines.push(format!(
+                "HOT {count} samples, {ms:.2} ms suspend/context/resume | {top_str}"
+            ));
+        }
     }
 
     if let Ok(mut g) = hud_lines().lock() {
@@ -786,6 +839,28 @@ unsafe extern "system" fn on_toggle_hud() {
     }
 }
 
+unsafe fn poll_legacy_hotkeys() {
+    if LEGACY_KEYS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let Some(h) = host() else { return };
+    let (Some(focused), Some(key_down)) = (h.focused, h.key_down) else {
+        return;
+    };
+    if unsafe { focused() } == 0 {
+        LEGACY_KEYS_DOWN.store(0b11, Ordering::Relaxed);
+        return;
+    }
+    let down = unsafe { u32::from(key_down(0x76) != 0) | (u32::from(key_down(0x77) != 0) << 1) };
+    let pressed = down & !LEGACY_KEYS_DOWN.swap(down, Ordering::Relaxed);
+    if pressed & 1 != 0 {
+        unsafe { on_reset() };
+    }
+    if pressed & 2 != 0 {
+        unsafe { on_toggle_hud() };
+    }
+}
+
 // ---------------------------------------------------------------- exports
 
 #[unsafe(no_mangle)]
@@ -794,7 +869,7 @@ pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
         let Some(h) = CokeHost::copy_from_raw(host) else {
             return 0;
         };
-        if h.api_version < 2 || (h.size as usize) < coke_host::COKE_HOST_V4_SIZE {
+        if h.api_version < 2 || (h.size as usize) < coke_host::COKE_HOST_V2_SIZE {
             return 0;
         }
         if HOST.set(h).is_err() {
@@ -817,8 +892,8 @@ pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
             set_timing(true);
         }
         log(&format!(
-            "coke-prof: api={} size={} sample={}Hz timing={} hud={} csv={}",
-            h.api_version, h.size, c.sample_hz, c.timing, c.hud, c.log_csv
+            "coke-prof: api={} size={} sampling={} sample_hz={} timing={} hud={} csv={}",
+            h.api_version, h.size, c.sample, c.sample_hz, c.timing, c.hud, c.log_csv
         ));
         if PROF_READ.load(Ordering::Relaxed) == 0 {
             log("coke-prof: proxy profiler exports not found; frame/thread data only");
@@ -835,7 +910,7 @@ pub unsafe extern "system" fn coke_init(host: *const CokeHost) -> i32 {
                 log("coke-prof: F8 hotkey rejected");
             }
         } else {
-            log("coke-prof: no hotkey bus; F7/F8 unavailable");
+            LEGACY_KEYS.store(1, Ordering::Relaxed);
         }
         log("coke-prof: F7 reset, F8 HUD. Log: coke-prof.csv");
         1
@@ -894,6 +969,7 @@ unsafe fn draw_hud() {
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn coke_tick() {
     unsafe {
+        poll_legacy_hotkeys();
         let c = cfg();
 
         if c.sample {

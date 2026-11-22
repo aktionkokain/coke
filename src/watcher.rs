@@ -1,30 +1,37 @@
 //! Background thread that finds the window and keeps every hook installed.
 
 use crate::*;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::ffi::{c_char, c_void};
 
 // ---- code ----
 // ------------------------------------------------------------------ watcher
 
-pub static ENUM_CM_BEST: AtomicUsize = AtomicUsize::new(0);
-pub static ENUM_CM_AREA: AtomicUsize = AtomicUsize::new(0);
-pub static ENUM_ANY_BEST: AtomicUsize = AtomicUsize::new(0);
-pub static ENUM_ANY_AREA: AtomicUsize = AtomicUsize::new(0);
 static DUMP_DONE: AtomicU32 = AtomicU32::new(0);
 
-pub extern "system" fn enum_main_window(hwnd: Hwnd, _param: isize) -> i32 {
+#[derive(Default)]
+struct WindowCandidates {
+    game: (usize, usize),
+    fallback: (usize, usize),
+}
+
+pub(crate) unsafe fn owns_window(hwnd: Hwnd) -> bool {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) != 0 && pid == GetCurrentProcessId() }
+}
+
+extern "system" fn enum_main_window(hwnd: Hwnd, param: isize) -> i32 {
     unsafe {
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid != GetCurrentProcessId() || IsWindowVisible(hwnd) == 0 {
+        if !owns_window(hwnd)
+            || IsWindowVisible(hwnd) == 0
+            || !GetWindow(hwnd, GW_OWNER).is_null()
+            || GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CHILD != 0
+        {
             return 1;
         }
-        if !GetWindow(hwnd, GW_OWNER).is_null() {
-            return 1;
-        }
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        if style & WS_CHILD != 0 {
+        let mut class = [0u8; 64];
+        let len = GetClassNameA(hwnd, class.as_mut_ptr().cast(), class.len() as i32);
+        if len <= 0 || class[..len as usize].eq_ignore_ascii_case(dialog::CLASS_NAME.as_bytes()) {
             return 1;
         }
         let mut r = Rect {
@@ -41,41 +48,43 @@ pub extern "system" fn enum_main_window(hwnd: Hwnd, _param: isize) -> i32 {
         if w < 320 || h < 240 {
             return 1;
         }
-        let area = w * h;
-        if area > ENUM_ANY_AREA.load(Ordering::Relaxed) {
-            ENUM_ANY_AREA.store(area, Ordering::Relaxed);
-            ENUM_ANY_BEST.store(hwnd as usize, Ordering::Relaxed);
+        let candidates = &mut *(param as *mut WindowCandidates);
+        let area = w.saturating_mul(h);
+        if area > candidates.fallback.0 {
+            candidates.fallback = (area, hwnd as usize);
         }
-        if class_is_cm(hwnd) && area > ENUM_CM_AREA.load(Ordering::Relaxed) {
-            ENUM_CM_AREA.store(area, Ordering::Relaxed);
-            ENUM_CM_BEST.store(hwnd as usize, Ordering::Relaxed);
+        if class_is_cm(hwnd) && area > candidates.game.0 {
+            candidates.game = (area, hwnd as usize);
         }
         1
     }
 }
 
-/// Find the engine's top-level window without depending on a title-specific
-/// class or caption. A "CM ..." class wins; otherwise the largest visible
-/// top-level window owned by this process is used.
-pub unsafe fn find_main_window() -> Hwnd {
+unsafe fn find_main_window(game_only: bool) -> Hwnd {
+    let mut candidates = WindowCandidates::default();
     unsafe {
-        let known = FindWindowA(
-            b"CM Black Sea\0".as_ptr() as *const c_char,
-            core::ptr::null(),
-        );
-        if !known.is_null() && IsWindowVisible(known) != 0 {
-            return known;
-        }
-        ENUM_CM_BEST.store(0, Ordering::Relaxed);
-        ENUM_CM_AREA.store(0, Ordering::Relaxed);
-        ENUM_ANY_BEST.store(0, Ordering::Relaxed);
-        ENUM_ANY_AREA.store(0, Ordering::Relaxed);
-        EnumWindows(enum_main_window, 0);
-        let cm = ENUM_CM_BEST.load(Ordering::Relaxed);
-        if cm != 0 {
-            return cm as Hwnd;
-        }
-        ENUM_ANY_BEST.load(Ordering::Relaxed) as Hwnd
+        EnumWindows(
+            enum_main_window,
+            &mut candidates as *mut WindowCandidates as isize,
+        )
+    };
+    if candidates.game.1 != 0 {
+        candidates.game.1 as Hwnd
+    } else if game_only {
+        core::ptr::null_mut()
+    } else {
+        candidates.fallback.1 as Hwnd
+    }
+}
+
+const GENERATION_PROPERTY: *const c_char = c"Coke.MainWindowGeneration".as_ptr();
+
+pub(crate) unsafe fn current_window(hwnd: Hwnd) -> bool {
+    unsafe {
+        MAIN_WINDOW.load(Ordering::Acquire) == hwnd as usize
+            && owns_window(hwnd)
+            && GetPropA(hwnd, GENERATION_PROPERTY) as usize
+                == WINDOW_GENERATION.load(Ordering::Acquire) as usize
     }
 }
 
@@ -86,8 +95,8 @@ pub extern "system" fn watcher_thread(_param: *mut c_void) -> u32 {
 pub unsafe fn watcher() -> u32 {
     unsafe {
         let cfg = config().clone();
-        let mut was_f11 = false;
-        let mut was_f9 = false;
+        let mut was_f11 = true;
+        let mut was_f9 = true;
         let mut last_client = 0usize;
         let mut client_since = GetTickCount();
         let mut ticks = 0u32;
@@ -186,20 +195,43 @@ pub unsafe fn watcher() -> u32 {
             // The engine finishes its own display init by destroying the window it
             // started with and creating a new one. A cached handle then points at
             // dead memory, so drop it and look the window up again.
-            if !hwnd.is_null() && IsWindow(hwnd) == 0 {
-                MAIN_WINDOW.store(0, Ordering::Relaxed);
-                ORIGINAL_WNDPROC.store(0, Ordering::Relaxed);
+            let replacement = if !hwnd.is_null() && ticks.is_multiple_of(25) && !class_is_cm(hwnd) {
+                find_main_window(true)
+            } else {
+                core::ptr::null_mut()
+            };
+            if !hwnd.is_null() && (!current_window(hwnd) || !replacement.is_null()) {
+                if current_window(hwnd) {
+                    RemovePropA(hwnd, GENERATION_PROPERTY);
+                }
+                MAIN_WINDOW.store(0, Ordering::Release);
                 INITIAL_MODE_DONE.store(0, Ordering::Relaxed);
                 WINDOW_DRAGGING.store(0, Ordering::Relaxed);
                 last_client = 0;
-                log("main window destroyed by the engine; waiting for the new one");
+                was_f9 = true;
+                was_f11 = true;
+                set_camera_input_capture(0);
+                hotkeys::poll(false);
+                log("main window changed; looking for the current game window");
                 hwnd = core::ptr::null_mut();
             }
 
             if hwnd.is_null() {
-                hwnd = find_main_window();
-                if !hwnd.is_null() {
-                    MAIN_WINDOW.store(hwnd as usize, Ordering::Relaxed);
+                hwnd = if replacement.is_null() {
+                    find_main_window(false)
+                } else {
+                    replacement
+                };
+                let generation = WINDOW_GENERATION
+                    .load(Ordering::Relaxed)
+                    .wrapping_add(1)
+                    .max(1);
+                if owns_window(hwnd)
+                    && SetPropA(hwnd, GENERATION_PROPERTY, generation as Handle) != 0
+                {
+                    WINDOW_GENERATION.store(generation, Ordering::Release);
+                    SCENE_GENERATION.fetch_add(1, Ordering::Relaxed);
+                    MAIN_WINDOW.store(hwnd as usize, Ordering::Release);
                     log_geometry(hwnd, "main window found");
                     if cfg.hook_wndproc {
                         install_wndproc_hook(hwnd);
@@ -214,6 +246,10 @@ pub unsafe fn watcher() -> u32 {
             // replace ours. Re-check it while the process is still settling.
             if (ticks < 12000 || ticks.is_multiple_of(100)) && cfg.hook_wndproc {
                 install_wndproc_hook(hwnd);
+            }
+
+            if !current_window(hwnd) {
+                continue;
             }
 
             // Keep the logical -> physical mapping in step with the real client
@@ -285,39 +321,31 @@ pub unsafe fn watcher() -> u32 {
                 log_geometry(hwnd, "after initial window mode");
             }
 
-            if !iconic && cfg.hook_mode {
-                // Only react when another application is not the one holding F11.
-                let focused = GetForegroundWindow() == hwnd;
-                let down = focused && GetAsyncKeyState(VK_F11) < 0;
-                if down && !was_f11 {
-                    let fullscreen = WINDOW_MODE.load(Ordering::Relaxed) == 1;
-                    log(&format!(
-                        "F11: {}",
-                        if fullscreen {
-                            "framed window"
-                        } else {
-                            "borderless fullscreen"
-                        }
-                    ));
-                    apply_window_mode(hwnd, !fullscreen);
-                    log_geometry(hwnd, "after F11");
-                }
-                was_f11 = down;
-
-                // F9: dump the live widget tree on demand (read-only diagnostic).
-                let dump_down = focused && GetAsyncKeyState(VK_F9) < 0;
-                if dump_down && !was_f9 {
-                    schedule_widget_dump(DUMP_ON_KEY);
-                }
-                was_f9 = dump_down;
+            let focused = !iconic && GetForegroundWindow() == hwnd;
+            if !focused && camera_input_capture() {
+                set_camera_input_capture(0);
             }
-
-            // Host-owned hotkey bus: F1-F12 callbacks registered by the core FPS
-            // counter and by mods. Polling and focus checks live here so mods do
-            // not each invent a loop on their worker thread.
-            if !iconic {
-                hotkeys::poll(GetForegroundWindow() == hwnd);
+            if hotkeys::key_pressed(&mut was_f11, focused, GetAsyncKeyState(VK_F11) < 0)
+                && cfg.hook_mode
+            {
+                let fullscreen = WINDOW_MODE.load(Ordering::Relaxed) == 1;
+                log(&format!(
+                    "F11: {}",
+                    if fullscreen {
+                        "framed window"
+                    } else {
+                        "borderless fullscreen"
+                    }
+                ));
+                apply_window_mode(hwnd, !fullscreen);
+                log_geometry(hwnd, "after F11");
             }
+            if hotkeys::key_pressed(&mut was_f9, focused, GetAsyncKeyState(VK_F9) < 0)
+                && cfg.hook_mode
+            {
+                schedule_widget_dump(DUMP_ON_KEY);
+            }
+            hotkeys::poll(focused);
 
             // Opt-in release check. Starts a worker at most once, a few seconds
             // after the window appears; no-op when `check_updates=off`.

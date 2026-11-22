@@ -576,7 +576,7 @@ pub unsafe fn draw_rgba_overlay(
     unsafe {
         let real_viewport = REAL_GL_VIEWPORT.load(Ordering::Relaxed);
         let real_draw_pixels = REAL_GL_DRAW_PIXELS.load(Ordering::Relaxed);
-        let real_window_pos = REAL_GL_WINDOW_POS.load(Ordering::Relaxed);
+        let real_window_pos = gl_proc(b"glWindowPos2i\0");
         if real_viewport == 0 || real_draw_pixels == 0 || real_window_pos == 0 {
             return;
         }
@@ -588,142 +588,30 @@ pub unsafe fn draw_rgba_overlay(
         let dp: unsafe extern "system" fn(i32, i32, u32, u32, *const u8) =
             core::mem::transmute(real_draw_pixels);
         let wp: unsafe extern "system" fn(i32, i32) = core::mem::transmute(real_window_pos);
-
-        let gl_disable = |id: u32| {
-            let f = REAL_GL_DISABLE.load(Ordering::Relaxed);
-            if f != 0 {
-                let f: unsafe extern "system" fn(u32) = core::mem::transmute(f);
-                f(id);
-            }
+        let Some(_server) = save_server_attributes() else {
+            return;
         };
-        let gl_enable = |id: u32| {
-            let f = REAL_GL_ENABLE.load(Ordering::Relaxed);
-            if f != 0 {
-                let f: unsafe extern "system" fn(u32) = core::mem::transmute(f);
-                f(id);
-            }
+        let Some(_client) = tight_pixel_store(false) else {
+            return;
+        };
+        let _framebuffer = default_draw_framebuffer();
+        let _program = unbind(gl_proc(b"glUseProgram\0"), 0x8b8d);
+        let _unpack = if pixel_buffers_supported() {
+            bind_zero(buffer_binding_proc(), 0x88ec, 0x88ef) // GL_PIXEL_UNPACK_BUFFER
+        } else {
+            None
         };
 
-        // Query which of the states we touch are currently enabled, so we can
-        // restore them exactly rather than blindly turning things back on.
-        let mut was_depth: u8 = 0;
-        let mut was_alpha: u8 = 0;
-        let mut was_blend: u8 = 0;
-        let mut was_stencil: u8 = 0;
-        let mut was_lighting: u8 = 0;
-        let mut was_texture: u8 = 0;
-        let mut was_scissor: u8 = 0;
-        let mut was_fog: u8 = 0;
-        let mut was_logic: u8 = 0;
-        let f_getb = REAL_GL_GET_BOOLEANV.load(Ordering::Relaxed);
-        if f_getb != 0 {
-            let getb: unsafe extern "system" fn(u32, *mut u8) = core::mem::transmute(f_getb);
-            getb(0x0B71, &mut was_depth); // GL_DEPTH_TEST
-            getb(0x0BC0, &mut was_alpha); // GL_ALPHA_TEST
-            getb(0x0BE2, &mut was_blend); // GL_BLEND
-            getb(0x0B90, &mut was_stencil); // GL_STENCIL_TEST
-            getb(0x0B50, &mut was_lighting); // GL_LIGHTING
-            getb(0x0DE1, &mut was_texture); // GL_TEXTURE_2D
-            getb(0x0C11, &mut was_scissor); // GL_SCISSOR_TEST
-            getb(0x0B60, &mut was_fog); // GL_FOG
-            getb(0x0BF2, &mut was_logic); // GL_COLOR_LOGIC_OP
+        let disable: unsafe extern "system" fn(u32) =
+            core::mem::transmute(REAL_GL_DISABLE.load(Ordering::Relaxed));
+        for state in [
+            0x0b71, 0x0bc0, 0x0be2, 0x0b90, 0x0b50, 0x0de1, 0x0c11, 0x0b60, 0x0bf2,
+        ] {
+            disable(state);
         }
-
-        // Save current viewport.
-        let mut saved_vp = [0i32; 4];
-        let f_geti = REAL_GL_GET_INTEGERV.load(Ordering::Relaxed);
-        if f_geti != 0 {
-            let geti: unsafe extern "system" fn(u32, *mut i32) = core::mem::transmute(f_geti);
-            geti(0x0BA2, saved_vp.as_mut_ptr()); // GL_VIEWPORT
-        }
-
-        // The engine may leave an offscreen render target bound at swap time. The
-        // text pipeline uses glDrawPixels, which would silently land in that FBO
-        // and never reach the screen (this is what made the FPS counter disappear
-        // when a world-overlay mod was active). Bind the default framebuffer for
-        // the draw and restore the engine's binding afterwards.
-        let bind_fbo = REAL_BIND_FRAMEBUFFER.load(Ordering::Relaxed);
-        let mut prev_fbo = 0i32;
-        if f_geti != 0 {
-            let geti: unsafe extern "system" fn(u32, *mut i32) = core::mem::transmute(f_geti);
-            geti(0x8CA6, &mut prev_fbo); // GL_FRAMEBUFFER_BINDING
-        }
-        if prev_fbo != 0 && bind_fbo != 0 {
-            let f: unsafe extern "system" fn(u32, u32) = core::mem::transmute(bind_fbo);
-            f(0x8D40, 0); // GL_FRAMEBUFFER
-        }
-
-        // Set up clean state for drawing.
-        gl_disable(0x0B71); // GL_DEPTH_TEST
-        gl_disable(0x0BC0); // GL_ALPHA_TEST
-        gl_disable(0x0BE2); // GL_BLEND
-        gl_disable(0x0B90); // GL_STENCIL_TEST
-        gl_disable(0x0B50); // GL_LIGHTING
-        gl_disable(0x0DE1); // GL_TEXTURE_2D
-        gl_disable(0x0C11); // GL_SCISSOR_TEST — it would clip the overlay
-        gl_disable(0x0B60); // GL_FOG — can tint the text into the background
-        gl_disable(0x0BF2); // GL_COLOR_LOGIC_OP — XOR/AND can erase the text
-
-        // Full physical viewport so glWindowPos coords map correctly.
         vp(0, 0, phys_w, phys_h);
-
-        // glWindowPos uses a bottom-left origin; convert the requested top-left y.
         wp(x, phys_h - ph - y_from_top);
-        dp(pw, ph, 0x1908, 0x1401, pixels.as_ptr()); // GL_RGBA, GL_UNSIGNED_BYTE
-
-        // Restore saved state.
-        if was_depth != 0 {
-            gl_enable(0x0B71);
-        } else {
-            gl_disable(0x0B71);
-        }
-        if was_alpha != 0 {
-            gl_enable(0x0BC0);
-        } else {
-            gl_disable(0x0BC0);
-        }
-        if was_blend != 0 {
-            gl_enable(0x0BE2);
-        } else {
-            gl_disable(0x0BE2);
-        }
-        if was_stencil != 0 {
-            gl_enable(0x0B90);
-        } else {
-            gl_disable(0x0B90);
-        }
-        if was_lighting != 0 {
-            gl_enable(0x0B50);
-        } else {
-            gl_disable(0x0B50);
-        }
-        if was_texture != 0 {
-            gl_enable(0x0DE1);
-        } else {
-            gl_disable(0x0DE1);
-        }
-        if was_scissor != 0 {
-            gl_enable(0x0C11);
-        } else {
-            gl_disable(0x0C11);
-        }
-        if was_fog != 0 {
-            gl_enable(0x0B60);
-        } else {
-            gl_disable(0x0B60);
-        }
-        if was_logic != 0 {
-            gl_enable(0x0BF2);
-        } else {
-            gl_disable(0x0BF2);
-        }
-        if prev_fbo != 0 && bind_fbo != 0 {
-            let f: unsafe extern "system" fn(u32, u32) = core::mem::transmute(bind_fbo);
-            f(0x8D40, prev_fbo as u32);
-        }
-        if f_geti != 0 {
-            vp(saved_vp[0], saved_vp[1], saved_vp[2], saved_vp[3]);
-        }
+        dp(pw, ph, 0x1908, 0x1401, pixels.as_ptr());
     }
 }
 
@@ -772,46 +660,94 @@ struct ScreenVertex {
 }
 
 static WORLD_DRAW_LOGGED: AtomicU32 = AtomicU32::new(0);
-static GL_USE_PROGRAM: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = not tried
-static GL_BIND_VAO: AtomicUsize = AtomicUsize::new(usize::MAX);
+pub(crate) struct Restore<F: FnOnce()>(Option<F>);
 
-unsafe fn wgl_proc(name: &[u8]) -> usize {
-    unsafe {
-        let wgl = REAL_WGL_GET_PROC_ADDRESS.load(Ordering::Relaxed);
-        if wgl == 0 {
-            return 0;
+impl<F: FnOnce()> Drop for Restore<F> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.0.take() {
+            restore();
         }
-        let f: unsafe extern "system" fn(*const std::ffi::c_char) -> *mut core::ffi::c_void =
-            core::mem::transmute(wgl);
-        f(name.as_ptr() as *const std::ffi::c_char) as usize
     }
 }
 
-/// Resolve `glUseProgram` lazily (it is a wgl extension, not an opengl32 export).
-unsafe fn use_program_ptr() -> usize {
-    unsafe {
-        let cached = GL_USE_PROGRAM.load(Ordering::Relaxed);
-        if cached != usize::MAX {
-            return cached;
-        }
-        let p = wgl_proc(b"glUseProgram\0");
-        GL_USE_PROGRAM.store(p, Ordering::Relaxed);
-        p
+unsafe fn save_server_attributes() -> Option<Restore<impl FnOnce()>> {
+    if gl_integer(0x0bb0) >= gl_integer(0x0d35) {
+        return None;
+    }
+    let push: unsafe extern "system" fn(u32) =
+        unsafe { core::mem::transmute(REAL_GL_PUSH_ATTRIB.load(Ordering::Relaxed)) };
+    let pop: unsafe extern "system" fn() =
+        unsafe { core::mem::transmute(REAL_GL_POP_ATTRIB.load(Ordering::Relaxed)) };
+    unsafe { push(0x000f_ffff) }; // GL_ALL_ATTRIB_BITS
+    Some(Restore(Some(move || unsafe { pop() })))
+}
+
+unsafe fn save_client_attributes(mask: u32) -> Option<Restore<impl FnOnce()>> {
+    if gl_integer(0x0bb1) >= gl_integer(0x0d3b) {
+        return None;
+    }
+    // The generated export thunks are declared as diverging. Internal calls
+    // need the real OpenGL functions with their returning signatures.
+    let push: unsafe extern "system" fn(u32) =
+        unsafe { core::mem::transmute(REAL_GL_PUSH_CLIENT_ATTRIB.load(Ordering::Relaxed)) };
+    let pop: unsafe extern "system" fn() =
+        unsafe { core::mem::transmute(REAL_GL_POP_CLIENT_ATTRIB.load(Ordering::Relaxed)) };
+    unsafe { push(mask) };
+    Some(Restore(Some(move || unsafe { pop() })))
+}
+
+pub(crate) unsafe fn tight_pixel_store(pack: bool) -> Option<Restore<impl FnOnce()>> {
+    let guard = unsafe { save_client_attributes(0x1) }?; // GL_CLIENT_PIXEL_STORE_BIT
+    let pixel_store: unsafe extern "system" fn(u32, i32) =
+        unsafe { core::mem::transmute(REAL_GL_PIXEL_STORE_I.load(Ordering::Relaxed)) };
+    let first = if pack { 0x0d00 } else { 0x0cf0 };
+    for (offset, value) in [0, 0, 0, 0, 0, 1].into_iter().enumerate() {
+        unsafe { pixel_store(first + offset as u32, value) };
+    }
+    Some(guard)
+}
+
+unsafe fn default_draw_framebuffer() -> Option<Restore<impl FnOnce()>> {
+    let (bind, target) = framebuffer_proc()?;
+    let previous = gl_integer(0x8ca6) as u32; // GL_DRAW_FRAMEBUFFER_BINDING
+    if previous == 0 {
+        return None;
+    }
+    unsafe { bind(target, 0) };
+    Some(Restore(Some(move || unsafe { bind(target, previous) })))
+}
+
+fn buffer_binding_proc() -> usize {
+    let core = gl_proc(b"glBindBuffer\0");
+    if core != 0 {
+        core
+    } else {
+        gl_proc(b"glBindBufferARB\0")
     }
 }
 
-/// Resolve `glBindVertexArray` so client arrays work even if the engine left a
-/// VAO bound.
-unsafe fn bind_vao_ptr() -> usize {
-    unsafe {
-        let cached = GL_BIND_VAO.load(Ordering::Relaxed);
-        if cached != usize::MAX {
-            return cached;
-        }
-        let p = wgl_proc(b"glBindVertexArray\0");
-        GL_BIND_VAO.store(p, Ordering::Relaxed);
-        p
+unsafe fn bind_zero(address: usize, target: u32, binding: u32) -> Option<Restore<impl FnOnce()>> {
+    if address == 0 {
+        return None;
     }
+    let previous = gl_integer(binding) as u32;
+    let bind: unsafe extern "system" fn(u32, u32) = unsafe { core::mem::transmute(address) };
+    if previous != 0 {
+        unsafe { bind(target, 0) };
+    }
+    Some(Restore(Some(move || unsafe { bind(target, previous) })))
+}
+
+unsafe fn unbind(address: usize, binding: u32) -> Option<Restore<impl FnOnce()>> {
+    if address == 0 {
+        return None;
+    }
+    let previous = gl_integer(binding) as u32;
+    let bind: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(address) };
+    if previous != 0 {
+        unsafe { bind(0) };
+    }
+    Some(Restore(Some(move || unsafe { bind(previous) })))
 }
 
 /// Physical-pixel rectangle used for world overlays. The proxy makes the engine
@@ -1026,8 +962,6 @@ unsafe fn draw_screen_quads(screen: &[ScreenVertex], pw: i32, ph: i32) {
         let real_draw = REAL_GL_DRAW_ARRAYS.load(Ordering::Relaxed);
         let real_ecs = REAL_GL_ENABLE_CLIENT_STATE.load(Ordering::Relaxed);
         let real_dcs = REAL_GL_DISABLE_CLIENT_STATE.load(Ordering::Relaxed);
-        let real_push = REAL_GL_PUSH_ATTRIB.load(Ordering::Relaxed);
-        let real_pop = REAL_GL_POP_ATTRIB.load(Ordering::Relaxed);
         let real_blend = REAL_GL_BLEND_FUNC.load(Ordering::Relaxed);
         let real_enable = REAL_GL_ENABLE.load(Ordering::Relaxed);
         let real_disable = REAL_GL_DISABLE.load(Ordering::Relaxed);
@@ -1063,35 +997,21 @@ unsafe fn draw_screen_quads(screen: &[ScreenVertex], pw: i32, ph: i32) {
         let enable: unsafe extern "system" fn(u32) = core::mem::transmute(real_enable);
         let disable: unsafe extern "system" fn(u32) = core::mem::transmute(real_disable);
 
-        // The engine may leave an offscreen render target bound at swap time. Query
-        // the real binding instead of trusting the tracked value: restoring a stale
-        // id could send the engine's next frame into a dead framebuffer (flicker).
-        let bind_fbo = REAL_BIND_FRAMEBUFFER.load(Ordering::Relaxed);
-        let fbo: Option<unsafe extern "system" fn(u32, u32)> = if bind_fbo != 0 {
-            Some(core::mem::transmute::<
-                usize,
-                unsafe extern "system" fn(u32, u32),
-            >(bind_fbo))
-        } else {
-            None
+        let Some(_server) = save_server_attributes() else {
+            return;
         };
-        let mut prev_fbo = 0i32;
+        let _framebuffer = default_draw_framebuffer();
+        let _program = unbind(gl_proc(b"glUseProgram\0"), 0x8b8d);
+        let _vao = unbind(gl_proc(b"glBindVertexArray\0"), 0x85b5);
+        let Some(_client) = save_client_attributes(0x2) else {
+            return;
+        }; // GL_CLIENT_VERTEX_ARRAY_BIT
+        let _array_buffer = bind_zero(buffer_binding_proc(), 0x8892, 0x8894);
+        if gl_integer(0x0ba3) >= gl_integer(0x0d36) // modelview stack
+            || gl_integer(0x0ba4) >= gl_integer(0x0d38)
+        // projection stack
         {
-            let geti = REAL_GL_GET_INTEGERV.load(Ordering::Relaxed);
-            if geti != 0 {
-                let g: unsafe extern "system" fn(u32, *mut i32) = core::mem::transmute(geti);
-                g(0x8CA6, &mut prev_fbo); // GL_FRAMEBUFFER_BINDING
-            }
-        }
-        if prev_fbo != 0
-            && let Some(f) = fbo
-        {
-            f(0x8D40, 0); // GL_FRAMEBUFFER
-        }
-
-        if real_push != 0 {
-            let push: unsafe extern "system" fn(u32) = core::mem::transmute(real_push);
-            push(0x000f_ffff); // GL_ALL_ATTRIB_BITS
+            return;
         }
         mm(GL_PROJECTION);
         pushm();
@@ -1130,67 +1050,29 @@ unsafe fn draw_screen_quads(screen: &[ScreenVertex], pw: i32, ph: i32) {
             blend(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         }
 
-        // With the depth test disabled, fragments still write depth. That can
-        // corrupt the engine's next frame (water planes, early-z, LOD), so turn
-        // writes off and restore the previous mask.
-        let dm = REAL_GL_DEPTH_MASK.load(Ordering::Relaxed);
-        let depth_mask: Option<unsafe extern "system" fn(u8)> = if dm != 0 {
-            Some(core::mem::transmute::<usize, unsafe extern "system" fn(u8)>(dm))
+        let depth_mask: unsafe extern "system" fn(u8) =
+            core::mem::transmute(REAL_GL_DEPTH_MASK.load(Ordering::Relaxed));
+        depth_mask(0);
+        for array in [0x8075, 0x8077, 0x8079] {
+            // normal, index, edge flag
+            dcs(array);
+        }
+        let client_active = gl_proc(b"glClientActiveTexture\0");
+        if client_active != 0 {
+            let active: unsafe extern "system" fn(u32) = core::mem::transmute(client_active);
+            for unit in 0..gl_integer(0x84e2).clamp(1, 32) as u32 {
+                active(0x84c0 + unit);
+                dcs(0x8078); // GL_TEXTURE_COORD_ARRAY
+            }
+            active(0x84c0);
         } else {
-            None
-        };
-        let mut prev_mask: u8 = 1;
-        {
-            let getb = REAL_GL_GET_BOOLEANV.load(Ordering::Relaxed);
-            if getb != 0 {
-                let g: unsafe extern "system" fn(u32, *mut u8) = core::mem::transmute(getb);
-                g(0x0B72, &mut prev_mask); // GL_DEPTH_WRITEMASK
-            }
+            dcs(0x8078);
         }
-        if let Some(f) = depth_mask {
-            f(0);
+        if gl_proc(b"glSecondaryColorPointer\0") != 0 {
+            dcs(0x845e); // GL_SECONDARY_COLOR_ARRAY
         }
-
-        // Client arrays are offsets into whatever VBO is bound; bind none so the
-        // engine's buffer binding cannot turn the overlay into garbage (and restore
-        // it afterwards, since attrib push does not cover buffer bindings).
-        let bind_buffer = REAL_GL_BIND_BUFFER.load(Ordering::Relaxed);
-        let mut prev_buf = 0i32;
-        if bind_buffer != 0 {
-            let geti = REAL_GL_GET_INTEGERV.load(Ordering::Relaxed);
-            if geti != 0 {
-                let g: unsafe extern "system" fn(u32, *mut i32) = core::mem::transmute(geti);
-                g(0x8894, &mut prev_buf); // GL_ARRAY_BUFFER_BINDING
-            }
-            if prev_buf != 0 {
-                let f: unsafe extern "system" fn(u32, u32) = core::mem::transmute(bind_buffer);
-                f(0x8892, 0); // GL_ARRAY_BUFFER
-            }
-        }
-
-        // The engine's last 3D/UI pass may have left a GLSL program bound; the
-        // fixed-function client arrays below are ignored while a program is active.
-        let use_prog = use_program_ptr();
-        let mut prev_prog = 0i32;
-        if use_prog != 0 {
-            let geti = REAL_GL_GET_INTEGERV.load(Ordering::Relaxed);
-            if geti != 0 {
-                let g: unsafe extern "system" fn(u32, *mut i32) = core::mem::transmute(geti);
-                g(0x8b8d, &mut prev_prog); // GL_CURRENT_PROGRAM
-            }
-            let f: unsafe extern "system" fn(u32) = core::mem::transmute(use_prog);
-            f(0);
-        }
-        let bind_vao = bind_vao_ptr();
-        let mut prev_vao = 0i32;
-        if bind_vao != 0 {
-            let geti = REAL_GL_GET_INTEGERV.load(Ordering::Relaxed);
-            if geti != 0 {
-                let g: unsafe extern "system" fn(u32, *mut i32) = core::mem::transmute(geti);
-                g(0x85b5, &mut prev_vao); // GL_VERTEX_ARRAY_BINDING
-            }
-            let f: unsafe extern "system" fn(u32) = core::mem::transmute(bind_vao);
-            f(0);
+        if gl_proc(b"glFogCoordPointer\0") != 0 {
+            dcs(0x8457); // GL_FOG_COORD_ARRAY
         }
 
         ecs(GL_VERTEX_ARRAY);
@@ -1208,38 +1090,9 @@ unsafe fn draw_screen_quads(screen: &[ScreenVertex], pw: i32, ph: i32) {
             screen.as_ptr().cast::<u8>().add(8) as *const _,
         );
         draw(GL_TRIANGLES, 0, screen.len() as i32);
-        dcs(GL_VERTEX_ARRAY);
-        dcs(GL_COLOR_ARRAY);
-        if let Some(f) = depth_mask {
-            f(prev_mask);
-        }
-        if bind_buffer != 0 && prev_buf != 0 {
-            let f: unsafe extern "system" fn(u32, u32) = core::mem::transmute(bind_buffer);
-            f(0x8892, prev_buf as u32);
-        }
-        if use_prog != 0 {
-            let f: unsafe extern "system" fn(u32) = core::mem::transmute(use_prog);
-            f(prev_prog as u32);
-        }
-        if bind_vao != 0 {
-            let f: unsafe extern "system" fn(u32) = core::mem::transmute(bind_vao);
-            f(prev_vao as u32);
-        }
-
-        if real_pop != 0 {
-            let pop: unsafe extern "system" fn() = core::mem::transmute(real_pop);
-            pop();
-        }
         popm();
         mm(GL_PROJECTION);
         popm();
-        mm(GL_MODELVIEW);
-
-        if prev_fbo != 0
-            && let Some(f) = fbo
-        {
-            f(0x8D40, prev_fbo as u32);
-        }
     }
 }
 

@@ -5,20 +5,22 @@
 //! stored in the `[state]` section of `coke_config.ini` next to the executable.
 //! With consent, a background
 //! thread asks the GitHub releases API once per launch for the latest tag,
-//! and a newer tag offers Download / Ignore this version / Never check again.
-//!
-//! The check is deliberately non-installing: Download only opens the releases
-//! page in the default browser.
+//! and offers the release page for a newer build. When automatic profile
+//! discovery found no match, it can also inspect the release's profile archive.
 
 use crate::*;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::io::Write;
+use std::io::{self, Write};
+use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
+use std::path::Path;
 
 const API_HOST: &str = "api.github.com";
 const API_PATH: &str = "/repos/aktionkokain/coke/releases/latest";
-const RELEASES_URL: &str = "https://github.com/aktionkokain/coke/releases";
+const RELEASE_HOST: &str = "github.com";
+const RELEASE_PATH: &str = "/aktionkokain/coke/releases";
 const CHECK_AFTER_MS: u32 = 4000;
-const MAX_BODY: usize = 64 * 1024;
+const MAX_RELEASE_JSON: usize = 64 * 1024;
+const MAX_PROFILE_ARCHIVE: usize = 2 * 1024 * 1024;
 
 static STARTED: AtomicU32 = AtomicU32::new(0);
 static FIRST_SEEN: AtomicU32 = AtomicU32::new(0);
@@ -47,15 +49,18 @@ pub unsafe fn tick(hwnd: Hwnd) {
         return;
     }
     let owner = hwnd as usize;
-    std::thread::spawn(move || unsafe { run(owner as Hwnd, mode) });
+    if let Err(error) = std::thread::Builder::new()
+        .name("coke-updates".into())
+        .spawn(move || unsafe { run(owner as Hwnd, mode) })
+    {
+        log(&format!("updates: cannot start worker: {error}"));
+    }
 }
 
 /// Persisted opt-in state.
 ///
 /// It lives in the `[state]` section of the main config file so there is only
-/// one file next to the executable; `deploy.ps1` carries that section over when
-/// it installs a new config. It is not a setting, so it stays out of the rest of
-/// the file.
+/// one configuration file next to the executable.
 #[derive(Default, Debug, PartialEq, Eq)]
 struct State {
     consent: Option<bool>,
@@ -69,42 +74,66 @@ const LEGACY_STATE_FILE: &str = "coke_state.ini";
 const STATE_SECTION: &str = "state";
 
 impl State {
-    fn path() -> std::path::PathBuf {
-        exe_dir().join(CONFIG_FILE)
-    }
-
     fn load() -> Self {
-        let text = std::fs::read_to_string(Self::path()).unwrap_or_default();
-        let state = parse_state(&text);
-
-        // Migrate a state file left by an older build, then delete it.
-        let legacy = exe_dir().join(LEGACY_STATE_FILE);
-        if !legacy.exists() {
-            return state;
-        }
-        let fallback = std::fs::read_to_string(&legacy)
-            .map(|text| parse_state(&format!("[{STATE_SECTION}]\n{text}")))
-            .unwrap_or_default();
-        let mut merged = state;
-        merged.consent = merged.consent.or(fallback.consent);
-        merged.disabled |= fallback.disabled;
-        merged.ignored = merged.ignored.or(fallback.ignored);
-        merged.notified = merged.notified.or(fallback.notified);
-        merged.save();
-        let _ = std::fs::remove_file(&legacy);
-        merged
+        Self::load_at(&config_path(), &exe_dir().join(LEGACY_STATE_FILE))
     }
 
-    fn save(&self) {
-        let path = Self::path();
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    fn load_at(path: &Path, legacy: &Path) -> Self {
+        let mut state = parse_state(&std::fs::read_to_string(path).unwrap_or_default());
+        let Ok(text) = std::fs::read_to_string(legacy) else {
+            return state;
+        };
+        let fallback = parse_state(&format!("[{STATE_SECTION}]\n{text}"));
+        if let Ok(saved) = Self::edit_at(path, |state| {
+            state.merge_legacy(&fallback);
+            Ok(())
+        }) {
+            let _ = std::fs::remove_file(legacy);
+            saved
+        } else {
+            state.merge_legacy(&fallback);
+            state
+        }
+    }
+
+    fn merge_legacy(&mut self, fallback: &Self) {
+        self.consent = self.consent.or(fallback.consent);
+        self.disabled |= fallback.disabled;
+        self.ignored = self.ignored.take().or_else(|| fallback.ignored.clone());
+        self.notified = self.notified.take().or_else(|| fallback.notified.clone());
+    }
+
+    fn edit(edit: impl FnOnce(&mut Self) -> io::Result<()>) -> io::Result<Self> {
+        Self::edit_at(&config_path(), edit)
+    }
+
+    fn edit_at(path: &Path, edit: impl FnOnce(&mut Self) -> io::Result<()>) -> io::Result<Self> {
+        let result = (|| {
+            let _lock = lock_state(path)?;
+            let text = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e),
+            };
+            let mut state = parse_state(&text);
+            edit(&mut state)?;
+            state.save(path, &text)?;
+            Ok(state)
+        })();
+        if let Err(ref error) = result {
+            log(&format!("updates: could not save state: {error}"));
+        }
+        result
+    }
+
+    fn save(&self, path: &Path, existing: &str) -> io::Result<()> {
         // Keep the file's CRLF/LF convention.
         let eol = if existing.contains("\r\n") {
             "\r\n"
         } else {
             "\n"
         };
-        let stripped = strip_state_section(&existing, eol);
+        let stripped = strip_state_section(existing, eol);
         let base = stripped.trim_end();
 
         let mut out = String::new();
@@ -137,8 +166,8 @@ impl State {
             let mut file = std::fs::File::create(&tmp)?;
             file.write_all(out.as_bytes())?;
             file.sync_all()?;
-            let from = unsafe { wide(&tmp.to_string_lossy()) };
-            let to = unsafe { wide(&path.to_string_lossy()) };
+            let from: Vec<u16> = tmp.as_os_str().encode_wide().chain([0]).collect();
+            let to: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
             if unsafe {
                 MoveFileExW(
                     from.as_ptr(),
@@ -151,9 +180,29 @@ impl State {
             }
             Ok(())
         })();
-        if let Err(e) = result {
+        if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
-            log(&format!("updates: cannot write {}: {e}", path.display()));
+        }
+        result
+    }
+}
+
+fn lock_state(config: &Path) -> io::Result<std::fs::File> {
+    let path = config.with_file_name(".coke-config.lock");
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path)
+        {
+            Err(e) if e.raw_os_error() == Some(32) && started.elapsed().as_millis() < 1000 => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result,
         }
     }
 }
@@ -163,12 +212,11 @@ fn parse_state(text: &str) -> State {
     let mut state = State::default();
     let mut in_state = false;
     for raw in text.lines() {
-        let line = raw.split(['#', ';']).next().unwrap_or("").trim();
+        let line = ini_content(raw);
         if line.is_empty() {
             continue;
         }
-        if let Some(name) = line.strip_prefix('[') {
-            let name = name.strip_suffix(']').unwrap_or(name).trim();
+        if let Some(name) = ini_section(line) {
             in_state = name.eq_ignore_ascii_case(STATE_SECTION);
             continue;
         }
@@ -209,9 +257,7 @@ fn strip_state_section(text: &str, eol: &str) -> String {
     let mut out = String::new();
     let mut in_state = false;
     for raw in text.lines() {
-        let trimmed = raw.trim();
-        if let Some(name) = trimmed.strip_prefix('[') {
-            let name = name.strip_suffix(']').unwrap_or(name).trim();
+        if let Some(name) = ini_section(ini_content(raw)) {
             in_state = name.eq_ignore_ascii_case(STATE_SECTION);
             if in_state {
                 continue;
@@ -220,7 +266,7 @@ fn strip_state_section(text: &str, eol: &str) -> String {
         if in_state {
             continue;
         }
-        out.push_str(raw.trim_end());
+        out.push_str(raw);
         out.push_str(eol);
     }
     out
@@ -229,15 +275,24 @@ fn strip_state_section(text: &str, eol: &str) -> String {
 unsafe fn run(owner: Hwnd, mode: u8) {
     unsafe {
         let mut state = State::load();
+        if state.disabled {
+            log("updates: not checking (disabled in the [state] section)");
+            return;
+        }
         let consent = match mode {
             UPDATE_CHECK_ON => true,
             _ => match state.consent {
                 Some(answer) => answer,
                 None => match ask_consent(owner) {
                     Some(answer) => {
-                        state.consent = Some(answer);
-                        state.save();
-                        answer
+                        let Ok(saved) = State::edit(|state| {
+                            state.consent = state.consent.or(Some(answer));
+                            Ok(())
+                        }) else {
+                            return;
+                        };
+                        state = saved;
+                        !state.disabled && state.consent == Some(true)
                     }
                     None => {
                         // Dismissed (clicked the game, close box, Escape):
@@ -253,35 +308,71 @@ unsafe fn run(owner: Hwnd, mode: u8) {
             log("updates: not checking (the player declined)");
             return;
         }
-        if mode == UPDATE_CHECK_ASK && state.disabled {
-            log("updates: not checking (disabled in the [state] section)");
-            return;
-        }
 
         // No interval throttle: the check runs once per launch (the STARTED
         // guard above), which is what "check when the game opens" means.
-        let Some(tag) = fetch_latest_tag() else {
+        let Some(release) = fetch(
+            API_HOST,
+            API_PATH,
+            "application/vnd.github+json",
+            MAX_RELEASE_JSON,
+        )
+        .and_then(|body| parse_release(&body)) else {
             log("updates: check failed or no release found");
             return;
         };
+        let tag = release.tag_name;
         log(&format!(
             "updates: latest release {tag} (running {VERSION})"
         ));
-        if !is_newer(&tag, VERSION) {
-            log("updates: up to date");
-            return;
-        }
-        if state.ignored.as_deref() == Some(tag.as_str())
-            || state.notified.as_deref() == Some(tag.as_str())
+        let newer = is_newer(&tag, VERSION);
+        if newer
+            && (state.ignored.as_deref() == Some(tag.as_str())
+                || state.notified.as_deref() == Some(tag.as_str()))
         {
             log(&format!("updates: {tag} already ignored or shown"));
             return;
         }
 
+        let archive_path = format!("{RELEASE_PATH}/download/{tag}/{PROFILES_ZIP}");
+        let matching_profile = !is_newer(VERSION, &tag)
+            && release
+                .assets
+                .iter()
+                .any(|asset| asset.name == PROFILES_ZIP)
+            && config().profile.is_none()
+            && profile::profile().is_none()
+            && check_release_profile(&archive_path)
+            && profile::profile().is_none();
+        if !newer {
+            log("updates: up to date");
+            if matching_profile
+                && prompt(
+                    owner,
+                    "Coke profiles",
+                    "A profile matches this game build",
+                    &format!(
+                        "Download {PROFILES_ZIP} from Coke {tag}, place it next to the game executable, and restart the game."
+                    ),
+                    &[("Download profiles", 1), ("Later", 0)],
+                    0,
+                    0,
+                ) == 1
+            {
+                open_url(&format!("https://{RELEASE_HOST}{archive_path}"));
+            }
+            return;
+        }
+
+        let release_url = format!("https://{RELEASE_HOST}{RELEASE_PATH}/tag/{tag}");
+        let profile_note = if matching_profile {
+            "\n\nThis release also includes a profile that matches your game build. Install the release and its PROFILES.zip together."
+        } else {
+            ""
+        };
         let body = format!(
             "You are running Coke {VERSION}; the latest release is {tag}. \
-             Download opens {RELEASES_URL} in your browser. Coke never installs \
-             an update for you."
+             Open release to download it in your browser.{profile_note}"
         );
         let choice = prompt(
             owner,
@@ -289,7 +380,7 @@ unsafe fn run(owner: Hwnd, mode: u8) {
             "A newer Coke release is available",
             &body,
             &[
-                ("Download", 1),
+                ("Open release", 1),
                 ("Ignore this version", 2),
                 ("Never check again", 3),
             ],
@@ -303,21 +394,58 @@ unsafe fn run(owner: Hwnd, mode: u8) {
         }
         match choice {
             1 => {
-                log(&format!("updates: opening {RELEASES_URL}"));
-                open_url(RELEASES_URL);
+                log(&format!("updates: opening {release_url}"));
+                open_url(&release_url);
             }
             2 => {
                 log(&format!("updates: ignoring {tag}"));
-                state.ignored = Some(tag.clone());
             }
             _ => {
                 log("updates: disabled by the player");
-                state.disabled = true;
             }
         }
         // Never ask about the same tag twice, whatever was chosen.
-        state.notified = Some(tag);
-        state.save();
+        let _ = State::edit(|state| {
+            if choice == 2 {
+                state.ignored = Some(tag.clone());
+            }
+            if choice == 3 {
+                state.disabled = true;
+            }
+            state.notified = Some(tag);
+            Ok(())
+        });
+    }
+}
+
+unsafe fn check_release_profile(path: &str) -> bool {
+    let Some(bytes) =
+        (unsafe { fetch(RELEASE_HOST, path, "application/zip", MAX_PROFILE_ARCHIVE) })
+    else {
+        log("updates: could not fetch the release profiles");
+        return false;
+    };
+    let exe = profile::discover_exe();
+    let size = profile::run_image_size();
+    let timestamp = profile::run_timestamp();
+    let hash = profile::text_hash();
+    match install::release_profile(&bytes, &exe, |p| {
+        profile::matches_build(p, size, timestamp, hash)
+    }) {
+        Ok(true) => {
+            log("updates: release has a matching profile");
+            true
+        }
+        Ok(false) => {
+            log("updates: release has no matching profile");
+            false
+        }
+        Err(error) => {
+            log(&format!(
+                "updates: could not inspect release profiles: {error}"
+            ));
+            false
+        }
     }
 }
 
@@ -326,8 +454,8 @@ unsafe fn ask_consent(owner: Hwnd) -> Option<bool> {
         let body = format!(
             "Coke can ask GitHub for the latest release every time the game \
              starts. It sends no \
-             personal data: just an ordinary HTTPS request for the public release \
-             list. Nothing is downloaded or installed automatically. The answer is \
+             personal data. If no local profile matches, Coke can also inspect the \
+             release's profile archive to look for a match. Installation is manual. The answer is \
              remembered in the [state] section of {CONFIG_FILE} next to the game, \
              and you can change it later with check_updates on or off.\n\n\
              Click the game, the close box or press Escape to decide later: \
@@ -350,8 +478,7 @@ unsafe fn ask_consent(owner: Hwnd) -> Option<bool> {
     }
 }
 
-/// Fetch the `tag_name` of the latest published GitHub release.
-unsafe fn fetch_latest_tag() -> Option<String> {
+unsafe fn fetch(host: &str, path: &str, accept: &str, limit: usize) -> Option<Vec<u8>> {
     unsafe {
         let session = WinHttpOpen(
             wide(&format!("Coke/{VERSION} update-check")).as_ptr(),
@@ -364,14 +491,14 @@ unsafe fn fetch_latest_tag() -> Option<String> {
             return None;
         }
         WinHttpSetTimeouts(session, 4000, 4000, 4000, 4000);
-        let mut tag = None;
+        let mut response = None;
 
-        let connect = WinHttpConnect(session, wide(API_HOST).as_ptr(), 443, 0);
+        let connect = WinHttpConnect(session, wide(host).as_ptr(), 443, 0);
         if !connect.is_null() {
             let request = WinHttpOpenRequest(
                 connect,
                 wide("GET").as_ptr(),
-                wide(API_PATH).as_ptr(),
+                wide(path).as_ptr(),
                 core::ptr::null(),
                 core::ptr::null(),
                 core::ptr::null(),
@@ -381,7 +508,7 @@ unsafe fn fetch_latest_tag() -> Option<String> {
                 // GitHub rejects requests without a User-Agent.
                 let headers = format!(
                     "User-Agent: Coke/{VERSION} update-check\r\n\
-                     Accept: application/vnd.github+json\r\n"
+                     Accept: {accept}\r\n"
                 );
                 let sent = WinHttpSendRequest(
                     request,
@@ -409,11 +536,14 @@ unsafe fn fetch_latest_tag() -> Option<String> {
                         log(&format!("updates: GitHub returned HTTP {status}"));
                     } else {
                         let mut body = Vec::new();
+                        let mut complete = false;
                         loop {
                             let mut available: u32 = 0;
-                            if WinHttpQueryDataAvailable(request, &mut available) == 0
-                                || available == 0
-                            {
+                            if WinHttpQueryDataAvailable(request, &mut available) == 0 {
+                                break;
+                            }
+                            if available == 0 {
+                                complete = true;
                                 break;
                             }
                             let want = available.min(4096);
@@ -429,12 +559,14 @@ unsafe fn fetch_latest_tag() -> Option<String> {
                             {
                                 break;
                             }
-                            body.extend_from_slice(&buf[..read as usize]);
-                            if body.len() >= MAX_BODY {
+                            if body.len() + read as usize > limit {
                                 break;
                             }
+                            body.extend_from_slice(&buf[..read as usize]);
                         }
-                        tag = parse_tag(&String::from_utf8_lossy(&body));
+                        if complete {
+                            response = Some(body);
+                        }
                     }
                 } else {
                     log("updates: HTTP request failed");
@@ -444,18 +576,34 @@ unsafe fn fetch_latest_tag() -> Option<String> {
             WinHttpCloseHandle(connect);
         }
         WinHttpCloseHandle(session);
-        tag
+        response
     }
 }
 
-/// Pull `"tag_name": "v0.2.0"` out of the release JSON without a JSON crate.
-fn parse_tag(json: &str) -> Option<String> {
-    let after_key = &json[json.find("\"tag_name\"")? + 10..];
-    let after_colon = &after_key[after_key.find(':')? + 1..];
-    let after_quote = &after_colon[after_colon.find('"')? + 1..];
-    let end = after_quote.find('"')?;
-    let tag = after_quote[..end].trim();
-    (!tag.is_empty()).then(|| tag.to_string())
+#[derive(serde::Deserialize)]
+struct Release {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReleaseAsset {
+    name: String,
+}
+
+fn parse_release(json: &[u8]) -> Option<Release> {
+    let mut release: Release = serde_json::from_slice(json).ok()?;
+    let tag = release.tag_name.trim();
+    if !tag
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'+'))
+    {
+        return None;
+    }
+    parse_version(tag)?;
+    release.tag_name = tag.to_owned();
+    Some(release)
 }
 
 fn parse_version(value: &str) -> Option<Vec<u64>> {
@@ -489,15 +637,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_the_tag_from_release_json() {
-        let json = r#"{"url":"x","tag_name":"v0.2.0","name":"0.2.0"}"#;
-        assert_eq!(parse_tag(json).as_deref(), Some("v0.2.0"));
-        assert_eq!(
-            parse_tag(r#"{"tag_name" : " 0.3 "}"#).as_deref(),
-            Some("0.3")
+    fn migration_preserves_legacy_on_write_failure_and_merges_on_success() {
+        let root =
+            std::env::temp_dir().join(format!("coke-update-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(CONFIG_FILE);
+        let legacy = root.join(LEGACY_STATE_FILE);
+        std::fs::write(&legacy, "update_disabled=1\n").unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(State::load_at(&path, &legacy).disabled);
+        assert!(legacy.is_file());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "[display]\nwidth=1234\n").unwrap();
+        assert!(State::load_at(&path, &legacy).disabled);
+        assert!(!legacy.exists());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("width=1234")
         );
-        assert_eq!(parse_tag(r#"{"name":"no tag"}"#), None);
-        assert_eq!(parse_tag(r#"{"tag_name":""}"#), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_updates_keep_both_user_choices() {
+        let root =
+            std::env::temp_dir().join(format!("coke-update-concurrent-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(CONFIG_FILE);
+        std::fs::write(&path, "width=1234\n").unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                State::edit_at(&path, |state| {
+                    state.consent = Some(true);
+                    Ok(())
+                })
+                .unwrap()
+            });
+            scope.spawn(|| {
+                State::edit_at(&path, |state| {
+                    state.disabled = true;
+                    Ok(())
+                })
+                .unwrap()
+            });
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        let state = parse_state(&text);
+        assert_eq!(state.consent, Some(true));
+        assert!(state.disabled);
+        assert!(text.contains("width=1234"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reads_release_tag_and_assets_and_rejects_unsafe_paths() {
+        let json = br#"{"tag_name":"v0.2.0","assets":[{"name":"PROFILES.zip"}]}"#;
+        let release = parse_release(json).unwrap();
+        assert_eq!(release.tag_name, "v0.2.0");
+        assert_eq!(release.assets[0].name, PROFILES_ZIP);
+        assert_eq!(
+            parse_release(br#"{"tag_name":" 0.3 "}"#).unwrap().tag_name,
+            "0.3"
+        );
+        assert!(parse_release(br#"{"name":"no tag"}"#).is_none());
+        assert!(parse_release(br#"{"tag_name":"v0.2.0-../../other"}"#).is_none());
     }
 
     #[test]

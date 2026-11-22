@@ -20,52 +20,7 @@
 use crate::*;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-pub const PROF_VERSION: u32 = 2;
-
-/// Snapshot handed to `coke_prof_read`. All counters are cumulative since the
-/// last `coke_prof_reset`. Times are nanoseconds (QPC converted).
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct CokeProfStats {
-    pub version: u32,
-    pub size: u32,
-
-    pub frames: u64,
-    pub frame_ns: u64,
-    pub last_frame_ns: u64,
-
-    pub swap_calls: u64,
-    pub swap_ns: u64,
-    pub last_swap_ns: u64,
-
-    pub call_list: u64,
-    pub call_list_ns: u64,
-    pub bind_texture: u64,
-    pub bind_texture_ns: u64,
-
-    pub begin_end: u64,
-    pub push_pop: u64,
-    pub draw_arrays: u64,
-    pub draw_elements: u64,
-    pub vertices: u64,
-
-    pub tex_upload: u64,
-    pub tex_upload_bytes: u64,
-    pub read_pixels: u64,
-    pub read_pixels_ns: u64,
-    pub copy_tex: u64,
-
-    pub lists_new: u64,
-    pub lists_called: u64,
-    pub lists_deleted: u64,
-
-    /// Frames for which the CPU-side frame time was measurable.
-    pub cpu_frames: u64,
-    /// Cumulative CPU-side frame time (engine work, excluding present).
-    pub cpu_frame_ns: u64,
-    /// CPU-side time of the most recent frame.
-    pub last_cpu_frame_ns: u64,
-}
+use coke_host::{COKE_PROF_VERSION, CokeProfStats};
 
 // ---- counters ------------------------------------------------------------
 
@@ -167,7 +122,7 @@ pub fn reset() {
 }
 
 pub fn snapshot(out: &mut CokeProfStats) {
-    out.version = PROF_VERSION;
+    out.version = COKE_PROF_VERSION;
     out.size = core::mem::size_of::<CokeProfStats>() as u32;
     out.frames = FRAMES.load(Ordering::Relaxed);
     out.frame_ns = FRAME_NS.load(Ordering::Relaxed);
@@ -319,7 +274,7 @@ pub unsafe fn frame_end(entry: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn coke_prof_version() -> u32 {
-    PROF_VERSION
+    COKE_PROF_VERSION
 }
 
 #[unsafe(no_mangle)]
@@ -332,11 +287,19 @@ pub extern "system" fn coke_prof_reset() {
     reset();
 }
 
-/// Copy a snapshot into `out`. Returns 1 on success, 0 for a null/short buffer.
+/// Legacy version 2 export. The caller provides the full frozen layout.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn coke_prof_read(out: *mut CokeProfStats) -> i32 {
+    unsafe { coke_prof_read_sized(out, size_of::<CokeProfStats>() as u32) }
+}
+
+/// Copy version 2 only when the caller declares enough writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn coke_prof_read_sized(out: *mut CokeProfStats, capacity: u32) -> i32 {
     unsafe {
-        if out.is_null() {
+        if (capacity as usize) < size_of::<CokeProfStats>()
+            || mod_span(out.cast::<u8>(), size_of::<CokeProfStats>(), true).is_none()
+        {
             return 0;
         }
         let mut s = CokeProfStats::default();
@@ -362,4 +325,23 @@ pub extern "system" fn coke_prof_last_swap_ns() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "system" fn coke_prof_last_cpu_frame_ns() -> u64 {
     LAST_CPU_FRAME_NS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sized_read_leaves_short_buffer_and_guards_untouched() {
+        let mut bytes = [0xa5u8; 240];
+        let expected = bytes;
+        let output = unsafe { bytes.as_mut_ptr().add(8).cast() };
+        assert_eq!(unsafe { coke_prof_read_sized(output, 215) }, 0);
+        assert_eq!(bytes, expected);
+        assert_eq!(unsafe { coke_prof_read_sized(output, 216) }, 1);
+        assert_eq!(&bytes[..8], &expected[..8]);
+        assert_eq!(&bytes[224..], &expected[224..]);
+        let snapshot: CokeProfStats = unsafe { output.read_unaligned() };
+        assert_eq!((snapshot.version, snapshot.size), (2, 216));
+    }
 }

@@ -51,6 +51,10 @@ pub struct Config {
     /// Release check: off, ask on first launch, or always on. See
     /// `UPDATE_CHECK_*`.
     pub check_updates: u8,
+    pub range_line_width: f32,
+    pub range_line_scale_distance: f32,
+    pub range_line_max_width: f32,
+    pub range_terrain_overlay_test: bool,
     /// 0 = uncapped.
     pub limit_fps: u32,
     /// Force wglSwapIntervalEXT to this value; `None` leaves the game alone.
@@ -139,6 +143,8 @@ pub struct Config {
     /// Log the full build identity, slot RVAs and resolved RTTI vtables once.
     /// Turns adding a profile for a new build into "launch once, copy numbers".
     pub profile_dump: bool,
+    pub safe_start: bool,
+    pub mod_worker_affinity: bool,
     /// Debug: write the live main module to `analysis/<exe>-image-pe.bin` once,
     /// after the packed image has unpacked. For decompiling, not for play.
     pub dump_module: bool,
@@ -159,6 +165,10 @@ impl Default for Config {
             resize_border: 10,
             resize_modifier: RESIZE_MODIFIER_CTRL_SHIFT,
             check_updates: UPDATE_CHECK_ASK,
+            range_line_width: 0.65,
+            range_line_scale_distance: 100.0,
+            range_line_max_width: 12.0,
+            range_terrain_overlay_test: false,
             limit_fps: 0,
             vsync: None,
             boost_workers: false,
@@ -190,6 +200,8 @@ impl Default for Config {
             los_clip_bottom_pct: 17,
             profile: None,
             profile_dump: false,
+            safe_start: false,
+            mod_worker_affinity: false,
             dump_module: false,
         }
     }
@@ -206,31 +218,49 @@ pub fn config() -> &'static Config {
 /// Reads the config file next to the executable. The names come from
 /// `names.ini` (`CONFIG_FILE` first, then any `LEGACY_CONFIG_FILES`), so an
 /// existing install keeps working after an upgrade.
-pub fn load_config() -> Config {
-    let mut cfg = Config::default();
+pub(crate) fn config_path() -> std::path::PathBuf {
     let dir = exe_dir();
-    let path = core::iter::once(CONFIG_FILE)
+    core::iter::once(CONFIG_FILE)
         .chain(LEGACY_CONFIG_FILES.iter().copied())
         .map(|name| dir.join(name))
-        .find(|p| p.exists());
-    let Some(path) = path else { return cfg };
+        .find(|p| p.exists())
+        .unwrap_or_else(|| dir.join(CONFIG_FILE))
+}
+
+pub(crate) fn ini_content(raw: &str) -> &str {
+    raw.trim_start_matches('\u{feff}')
+        .split(['#', ';'])
+        .next()
+        .unwrap_or("")
+        .trim()
+}
+
+pub(crate) fn ini_section(line: &str) -> Option<&str> {
+    line.strip_prefix('[')?.strip_suffix(']').map(str::trim)
+}
+
+pub fn load_config() -> Config {
+    let mut cfg = Config::default();
+    let path = config_path();
+    cfg.safe_start = std::env::var_os("COKE_SAFE_START").is_some_and(|value| value == "1");
+    if cfg.safe_start {
+        cfg.profile = Some("none".into());
+    }
     let Ok(text) = std::fs::read_to_string(&path) else {
         return cfg;
     };
     let mut in_state = false;
     for raw in text.lines() {
-        let trimmed = raw.trim();
+        let line = ini_content(raw);
         // `[state]` is runtime data written by the proxy, not settings. Skip it
         // so a state key can never be mistaken for a config key.
-        if let Some(name) = trimmed.strip_prefix('[') {
-            let name = name.strip_suffix(']').unwrap_or(name).trim();
+        if let Some(name) = ini_section(line) {
             in_state = name.eq_ignore_ascii_case("state");
             continue;
         }
         if in_state {
             continue;
         }
-        let line = raw.split(['#', ';']).next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
@@ -244,6 +274,9 @@ pub fn load_config() -> Config {
             continue;
         };
         apply_setting(&mut cfg, key, value);
+    }
+    if cfg.safe_start {
+        cfg.profile = Some("none".into());
     }
     cfg
 }
@@ -343,6 +376,20 @@ pub fn apply_setting(cfg: &mut Config, key: &str, value: &str) {
                 _ => UPDATE_CHECK_ASK,
             };
         }
+        "range_terrain_overlay_test" => cfg.range_terrain_overlay_test = on,
+        "range_line_width" | "range_line_scale_distance" | "range_line_max_width" => {
+            if let Ok(width) = value.parse::<f32>()
+                && width.is_finite()
+            {
+                match key.as_str() {
+                    "range_line_width" => cfg.range_line_width = width.clamp(0.05, 32.0),
+                    "range_line_scale_distance" => {
+                        cfg.range_line_scale_distance = width.clamp(0.0, 10_000.0);
+                    }
+                    _ => cfg.range_line_max_width = width.clamp(0.05, 32.0),
+                }
+            }
+        }
         "scale_fixes" | "scale" => cfg.scale_fixes = on,
         "promote_scene" | "promote" | "scene_promote" => cfg.promote_scene = on,
         "hook_slots" => cfg.hook_slots = on,
@@ -396,6 +443,7 @@ pub fn apply_setting(cfg: &mut Config, key: &str, value: &str) {
             }
         }
         "profile_dump" | "dump_profile" => cfg.profile_dump = on,
+        "mod_worker_affinity" => cfg.mod_worker_affinity = on,
         "dump_module" | "dump_image" => cfg.dump_module = on,
         _ => {}
     }

@@ -7,13 +7,70 @@
 //! The ABI is append-only: v1 fields stay first, and each later block is added
 //! at the end. A mod must check `api_version` and `size` before touching a field
 //! newer than the block it was compiled against.
+//!
+//! Call registration and layer selection synchronously from `coke_init`.
+//! Draw services run on the presentation thread inside `coke_frame` or
+//! `coke_hud`. The worker may call `coke_tick` concurrently, and hotkeys
+//! run on the watcher thread. Mods synchronize their own shared data.
+//! Buffers belong to the caller for the duration of each service call;
+//! all output spans must be writable, aligned and disjoint.
 
 #![no_std]
 
 use core::ffi::c_char;
 
+pub const COKE_PROF_VERSION: u32 = 2;
+
+/// Snapshot handed to `coke_prof_read`. All counters are cumulative since the
+/// last `coke_prof_reset`. Times are nanoseconds (QPC converted).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CokeProfStats {
+    pub version: u32,
+    pub size: u32,
+
+    pub frames: u64,
+    pub frame_ns: u64,
+    pub last_frame_ns: u64,
+
+    pub swap_calls: u64,
+    pub swap_ns: u64,
+    pub last_swap_ns: u64,
+
+    pub call_list: u64,
+    pub call_list_ns: u64,
+    pub bind_texture: u64,
+    pub bind_texture_ns: u64,
+
+    pub begin_end: u64,
+    pub push_pop: u64,
+    pub draw_arrays: u64,
+    pub draw_elements: u64,
+    pub vertices: u64,
+
+    pub tex_upload: u64,
+    pub tex_upload_bytes: u64,
+    pub read_pixels: u64,
+    pub read_pixels_ns: u64,
+    pub copy_tex: u64,
+
+    pub lists_new: u64,
+    pub lists_called: u64,
+    pub lists_deleted: u64,
+
+    /// Frames for which the CPU-side frame time was measurable.
+    pub cpu_frames: u64,
+    /// Cumulative CPU-side frame time (engine work, excluding present).
+    pub cpu_frame_ns: u64,
+    /// CPU-side time of the most recent frame.
+    pub last_cpu_frame_ns: u64,
+}
+
 /// Current host API version. Bumped whenever the table grows.
-pub const COKE_HOST_API: u32 = 7;
+pub const COKE_HOST_API: u32 = 8;
+
+/// Size of the original v2 prefix, through the time callback.
+pub const COKE_HOST_V2_SIZE: usize = core::mem::offset_of!(CokeHost, draw_world_lines);
 
 /// Size of the API v2.1 prefix (everything up to and including `los_scan_map`).
 ///
@@ -27,6 +84,8 @@ pub const COKE_HOST_V4_SIZE: usize = core::mem::offset_of!(CokeHost, camera_appl
 
 /// Size through the v6 camera controls.
 pub const COKE_HOST_V6_SIZE: usize = core::mem::offset_of!(CokeHost, range_control);
+/// Size through the v7 range-preview ABI.
+pub const COKE_HOST_V7_SIZE: usize = core::mem::offset_of!(CokeHost, range_capabilities);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -78,7 +137,9 @@ pub struct WorldVertex {
     pub rgba: u32,
 }
 
-/// Whole-map / ray LOS scan callback (v2 / v2.1).
+/// Local visibility grid in world metres. Buffer lengths count elements
+/// (`u8` visibility and `f32` height), with row-major output and X varying first.
+/// The last two outputs are the grid dimensions.
 pub type LosScanFn = unsafe extern "system" fn(
     f32,
     f32,
@@ -94,7 +155,8 @@ pub type LosScanFn = unsafe extern "system" fn(
     *mut i32,
 ) -> i32;
 
-/// Whole-map visibility grid callback (v2.1).
+/// Whole-map visibility grid, with the same buffer and dimension units as
+/// `LosScanFn`. The grid starts at world (0, 0).
 pub type LosScanMapFn = unsafe extern "system" fn(
     f32,
     f32,
@@ -124,6 +186,38 @@ pub const RANGE_CANCEL: u32 = 4;
 /// are ignored. Accepted heights are 0.25 through 6.0 metres. Existing v7
 /// table layout is unchanged.
 pub const RANGE_SET_SOURCE_HEIGHT: u32 = 5;
+/// Replace the transient LOS terrain tint with the supplied tile set. A zero
+/// tile count clears the tint. The opaque map value must match the live scene.
+pub const RANGE_PAINT_TERRAIN: u32 = 6;
+/// Toggle native visibility paint using the rendered surface under the cursor.
+pub const RANGE_TOGGLE_TERRAIN_LOS: u32 = 7;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CokeTerrainTile {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    /// 1 = visible (green), 0 = blocked (red); 2 is the blue test palette.
+    pub visible: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CokeTerrainTiles {
+    pub map: u32,
+    pub world_w: f32,
+    pub world_h: f32,
+    pub tiles: *const CokeTerrainTile,
+    pub count: u32,
+}
+
+/// `range_capabilities` flags.
+pub const RANGE_CAP_PROFILED: u32 = 1 << 0;
+pub const RANGE_CAP_HOOK_INSTALLED: u32 = 1 << 1;
+pub const RANGE_CAP_TERRAIN_PAINT: u32 = 1 << 2;
+pub const RANGE_CAP_TERRAIN_LOS: u32 = 1 << 3;
 
 /// Range preview status values returned in `CokeRangeResult::status`.
 pub const RANGE_WAITING: u32 = 1;
@@ -153,6 +247,7 @@ pub struct CokeRangeResult {
 
 pub type RangeControlFn = unsafe extern "system" fn(u32, *const CokeRangePoint) -> i32;
 pub type RangeReadFn = unsafe extern "system" fn(*mut CokeRangeResult) -> i32;
+pub type RangeCapabilitiesFn = unsafe extern "system" fn() -> u32;
 
 /// Host services exposed to a `coke` mod. `#[repr(C)]` so a C or Rust DLL can
 /// use the same layout. See the module docs for the append-only rule.
@@ -204,7 +299,8 @@ pub struct CokeHost {
     /// Register an F1-F12 callback with the host-owned hotkey bus. The host
     /// owns polling, focus checks and rising-edge de-duplication, so one press
     /// fires each registered callback exactly once. Returns 1 when accepted.
-    /// A key outside F1-F12 is rejected. See the key map in `docs/ai/CONFIG.md`.
+    /// Register from `coke_init`. Accepted registrations become active after
+    /// initialization succeeds. F9 and F11 are reserved by the host.
     pub register_hotkey: Option<RegisterHotkeyFn>,
     /// Set this mod's draw-order layer. Call once from `coke_init`; higher
     /// layers draw later (on top). Mods that never call it use layer 0 and keep
@@ -212,21 +308,31 @@ pub struct CokeHost {
     pub set_layer: Option<unsafe extern "system" fn(i32)>,
 
     // ---- v5 (appended; mods must check `api_version` and `size`) ----
-    /// Apply one validated camera command to the live camera object.
+    /// Queue a validated camera command for the presentation thread to apply
+    /// between frames, while the originating battle window is focused.
     pub camera_apply: Option<CameraApplyFn>,
     /// Return and clear wheel notches observed by the host window procedure.
     pub camera_wheel_delta: Option<CameraWheelFn>,
-    /// Claim the native camera input boundary while non-zero.
+    /// Camera capture bits: 1 claims native camera input, 2 enables free
+    /// flight and R/F suppression, 4 disables free-flight terrain clearance.
+    /// Pass 0 to release capture.
     pub camera_input_capture: Option<unsafe extern "system" fn(i32) -> i32>,
 
     // ---- v7 (appended) ----
     /// Control the shared native range preview. A return of 1 accepts the request.
     /// RANGE_SET_ORIGIN takes a ground point in world metres, x east, y north, z up.
-    /// Other actions ignore the pointer. Commands may be submitted from any phase.
+    /// RANGE_SET_SOURCE_HEIGHT reads only point.z, in metres. Other actions
+    /// ignore the pointer. During initialization, only RANGE_ENABLE_KEYS is
+    /// accepted and it takes effect after the mod accepts initialization.
     pub range_control: Option<RangeControlFn>,
     /// Copy the latest active preview for the caller. A return of 0 means idle,
     /// unsupported or no current scene. Callable from any phase.
     pub range_read: Option<RangeReadFn>,
+
+    // ---- v8 (appended) ----
+    /// Return `RANGE_CAP_*` bits for the active matched title/build. A profiled
+    /// backend is configured; a hook-installed backend is ready to draw.
+    pub range_capabilities: Option<RangeCapabilitiesFn>,
 }
 
 impl CokeHost {

@@ -26,7 +26,7 @@ pub fn log(msg: &str) {
         // wraps after 49 days and is identical across launches, which made
         // entries from different runs impossible to tell apart.
         let elapsed = unsafe { GetTickCount() }.wrapping_sub(LOG_T0.load(Ordering::Relaxed));
-        let _ = writeln!(f, "[{elapsed:>7} ms] {msg}");
+        let _ = f.write_all(format!("[{elapsed:>7} ms] {msg}\n").as_bytes());
     }
 }
 

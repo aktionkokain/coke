@@ -52,11 +52,14 @@ pub struct Slots {
     pub get_system_metrics: u32,
     pub change_display: u32,
     pub get_cursor_pos: u32,
+    pub show_window: u32,
+    pub show_window_async: u32,
+    pub get_async_key_state: u32,
 }
 
 impl Slots {
     pub fn any(&self) -> bool {
-        self.close_window | self.get_system_metrics | self.change_display | self.get_cursor_pos != 0
+        *self != Self::default()
     }
 }
 
@@ -131,6 +134,44 @@ pub struct Los {
     pub world_h_off: u32,
 }
 
+/// Read-only anchors needed to discover the active heightfield. Keeping these
+/// separate from `[los]` lets other features (such as native range preview)
+/// reuse terrain data without claiming that the LOS adapter is complete.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+pub struct TerrainMap {
+    pub world_ptr: u32,
+    pub action_map_off: u32,
+    pub map_globals: Vec<u32>,
+    pub vt_action_map: u32,
+    pub vt_terrain_map: u32,
+    pub height_off: u32,
+    pub grid_w_off: u32,
+    pub grid_h_off: u32,
+    pub world_w_off: u32,
+    pub world_h_off: u32,
+}
+
+impl TerrainMap {
+    fn with_defaults(mut self) -> TerrainMap {
+        if self.height_off == 0 {
+            self.height_off = 0x9c;
+        }
+        if self.grid_w_off == 0 {
+            self.grid_w_off = 0xa0;
+        }
+        if self.grid_h_off == 0 {
+            self.grid_h_off = 0xa4;
+        }
+        if self.world_w_off == 0 {
+            self.world_w_off = 0x04;
+        }
+        if self.world_h_off == 0 {
+            self.world_h_off = 0x08;
+        }
+        self
+    }
+}
+
 impl Los {
     fn with_defaults(mut self) -> Los {
         if self.height_off == 0 {
@@ -155,6 +196,11 @@ impl Los {
 /// Native range preview addresses on a matched engine image.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RangePreview {
+    /// Bitset of world command states in which the native Target preview is
+    /// valid. Bit N permits command state N; defaults to state 0.
+    pub command_states: u32,
+    /// Battle owner offset of the native ribbon pool.
+    pub ribbon_pool_off: u32,
     pub draw_call: u32,
     pub draw_flush: u32,
     pub trace: u32,
@@ -184,6 +230,7 @@ pub struct Profile {
     /// Class name -> vtable RVA. Names keep their original case.
     pub rtti: Vec<(String, u32)>,
     pub los: Option<Los>,
+    pub terrain: Option<TerrainMap>,
     pub range: Option<RangePreview>,
     /// Where this profile came from, for the selection log line.
     pub source: String,
@@ -214,6 +261,9 @@ impl Profile {
         }
         if self.los.is_some() {
             v.push("los");
+        }
+        if self.terrain.is_some() {
+            v.push("terrain");
         }
         if self.range.is_some() {
             v.push("range");
@@ -303,6 +353,26 @@ pub fn los() -> Option<&'static Los> {
     profile().and_then(|p| p.los.as_ref())
 }
 
+pub fn terrain_anchors() -> Option<TerrainMap> {
+    let p = profile()?;
+    if let Some(t) = &p.terrain {
+        return Some(t.clone());
+    }
+    let l = p.los.as_ref()?;
+    Some(TerrainMap {
+        world_ptr: l.world_ptr,
+        action_map_off: l.action_map_off,
+        map_globals: l.map_globals.clone(),
+        vt_action_map: l.vt_action_map,
+        vt_terrain_map: l.vt_terrain_map,
+        height_off: l.height_off,
+        grid_w_off: l.grid_w_off,
+        grid_h_off: l.grid_h_off,
+        world_w_off: l.world_w_off,
+        world_h_off: l.world_h_off,
+    })
+}
+
 /// The profile's scene inset, or the last-resort layout constant.
 pub fn scene_inset_default() -> i32 {
     scene()
@@ -329,6 +399,7 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
         scene: None,
         rtti: Vec::new(),
         los: None,
+        terrain: None,
         range: None,
         source: source.to_string(),
     };
@@ -350,9 +421,11 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
         blur_quad_enable_off: 0,
     };
     let mut los = Los::default();
+    let mut terrain = TerrainMap::default();
     let mut have_canvas = false;
     let mut have_scene = false;
     let mut have_los = false;
+    let mut have_terrain = false;
     let mut unknown = Vec::new();
 
     for (lineno, raw) in text.lines().enumerate() {
@@ -371,8 +444,13 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
                 "canvas" => have_canvas = true,
                 "scene" => have_scene = true,
                 "los" => have_los = true,
+                "terrain" => have_terrain = true,
                 "range" => {
-                    p.range.get_or_insert_with(RangePreview::default);
+                    p.range.get_or_insert_with(|| RangePreview {
+                        command_states: 1,
+                        ribbon_pool_off: 0xc99c,
+                        ..RangePreview::default()
+                    });
                 }
                 "profile" | "slots" | "rtti" => {}
                 other => unknown.push(format!("section [{other}]")),
@@ -405,6 +483,9 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
                     "get_system_metrics" | "metrics" => p.slots.get_system_metrics = v,
                     "change_display" | "change_display_settings_a" => p.slots.change_display = v,
                     "get_cursor_pos" => p.slots.get_cursor_pos = v,
+                    "show_window" => p.slots.show_window = v,
+                    "show_window_async" => p.slots.show_window_async = v,
+                    "get_async_key_state" => p.slots.get_async_key_state = v,
                     _ => unknown.push(format!("{section}.{key}")),
                 }
             }
@@ -452,6 +533,8 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
                 let r = p.range.get_or_insert_with(RangePreview::default);
                 let v = num(value)?;
                 match key.to_ascii_lowercase().as_str() {
+                    "command_states" => r.command_states = v,
+                    "ribbon_pool_off" => r.ribbon_pool_off = v,
                     "draw_call" => r.draw_call = v,
                     "draw_flush" => r.draw_flush = v,
                     "trace" => r.trace = v,
@@ -495,6 +578,30 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
                     _ => unknown.push(format!("{section}.{key}")),
                 }
             }
+            "terrain" => {
+                if key.eq_ignore_ascii_case("map_globals") {
+                    for part in value.split(',') {
+                        let part = part.trim();
+                        if !part.is_empty() {
+                            terrain.map_globals.push(num(part)?);
+                        }
+                    }
+                    continue;
+                }
+                let v = num(value)?;
+                match key.to_ascii_lowercase().as_str() {
+                    "world_ptr" => terrain.world_ptr = v,
+                    "action_map_off" => terrain.action_map_off = v,
+                    "vt_action_map" => terrain.vt_action_map = v,
+                    "vt_terrain_map" => terrain.vt_terrain_map = v,
+                    "height_off" => terrain.height_off = v,
+                    "grid_w_off" => terrain.grid_w_off = v,
+                    "grid_h_off" => terrain.grid_h_off = v,
+                    "world_w_off" => terrain.world_w_off = v,
+                    "world_h_off" => terrain.world_h_off = v,
+                    _ => unknown.push(format!("{section}.{key}")),
+                }
+            }
             "" => return Err(format!("line {}: value before any [section]", lineno + 1)),
             _ => unknown.push(format!("{section}.{key}")),
         }
@@ -526,6 +633,15 @@ pub fn parse(text: &str, source: &str) -> Result<Profile, String> {
             return Err("[los] has neither world_ptr nor map_globals".to_string());
         }
         p.los = Some(los.with_defaults());
+    }
+    if have_terrain {
+        if terrain.world_ptr == 0 && terrain.map_globals.is_empty() {
+            return Err("[terrain] has neither world_ptr nor map_globals".to_string());
+        }
+        if terrain.vt_action_map == 0 && terrain.vt_terrain_map == 0 {
+            return Err("[terrain] has no ActionMap or TerrainMap vtable".to_string());
+        }
+        p.terrain = Some(terrain.with_defaults());
     }
     if !unknown.is_empty() {
         log(&format!(
@@ -566,6 +682,9 @@ pub fn validate_addresses(p: &Profile) -> Result<(), String> {
     check("slots.get_system_metrics", p.slots.get_system_metrics)?;
     check("slots.change_display", p.slots.change_display)?;
     check("slots.get_cursor_pos", p.slots.get_cursor_pos)?;
+    check("slots.show_window", p.slots.show_window)?;
+    check("slots.show_window_async", p.slots.show_window_async)?;
+    check("slots.get_async_key_state", p.slots.get_async_key_state)?;
     if let Some(c) = &p.canvas {
         check("canvas.app_ptr", c.app_ptr)?;
         if c.app_hwnd_off > 0x10000 {
@@ -618,12 +737,55 @@ pub fn validate_addresses(p: &Profile) -> Result<(), String> {
             check("los.map_globals", *g)?;
         }
     }
+    if let Some(t) = &p.terrain {
+        for (what, rva) in [
+            ("world_ptr", t.world_ptr),
+            ("vt_action_map", t.vt_action_map),
+            ("vt_terrain_map", t.vt_terrain_map),
+        ] {
+            check(&format!("terrain.{what}"), rva)?;
+        }
+        for g in &t.map_globals {
+            check("terrain.map_globals", *g)?;
+        }
+        for (what, off) in [
+            ("action_map_off", t.action_map_off),
+            ("height_off", t.height_off),
+            ("grid_w_off", t.grid_w_off),
+            ("grid_h_off", t.grid_h_off),
+            ("world_w_off", t.world_w_off),
+            ("world_h_off", t.world_h_off),
+        ] {
+            if off > 0x10000 {
+                return Err(format!("terrain.{what} 0x{off:x} is too large"));
+            }
+        }
+    }
     if let Some(r) = p.range {
         if p.text_fnv1a.is_none()
-            || p.los.is_none()
+            || (p.los.is_none() && p.terrain.is_none())
             || p.scene.as_ref().is_none_or(|s| s.owner_ptr == 0)
         {
-            return Err("[range] requires a text hash, [scene] owner_ptr and [los]".to_string());
+            return Err(
+                "[range] requires a text hash, [scene] owner_ptr and terrain anchors".to_string(),
+            );
+        }
+        let Some(terrain) = terrain_anchors_for(p) else {
+            return Err("[range] requires terrain anchors".to_string());
+        };
+        if terrain.world_ptr == 0
+            || (terrain.vt_action_map == 0 && terrain.vt_terrain_map == 0)
+            || (terrain.map_globals.is_empty() && terrain.action_map_off == 0)
+        {
+            return Err(
+                "[range] terrain anchors need world_ptr, a map vtable and a map source".to_string(),
+            );
+        }
+        if r.command_states == 0 {
+            return Err("[range] command_states must allow at least one state".to_string());
+        }
+        if r.ribbon_pool_off == 0 || r.ribbon_pool_off > 0x100000 || r.ribbon_pool_off % 4 != 0 {
+            return Err("[range] invalid ribbon_pool_off".to_string());
         }
         for (what, rva) in [
             ("draw_call", r.draw_call),
@@ -644,6 +806,25 @@ pub fn validate_addresses(p: &Profile) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn terrain_anchors_for(p: &Profile) -> Option<TerrainMap> {
+    if let Some(t) = &p.terrain {
+        return Some(t.clone());
+    }
+    let l = p.los.as_ref()?;
+    Some(TerrainMap {
+        world_ptr: l.world_ptr,
+        action_map_off: l.action_map_off,
+        map_globals: l.map_globals.clone(),
+        vt_action_map: l.vt_action_map,
+        vt_terrain_map: l.vt_terrain_map,
+        height_off: l.height_off,
+        grid_w_off: l.grid_w_off,
+        grid_h_off: l.grid_h_off,
+        world_w_off: l.world_w_off,
+        world_h_off: l.world_h_off,
+    })
 }
 
 // ----------------------------------------------------------------- discovery
@@ -673,21 +854,34 @@ fn profiles_dir() -> PathBuf {
 }
 
 fn ini_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            ini_files(&p, out);
-        } else if p
-            .extension()
-            .map(|e| e.eq_ignore_ascii_case("ini"))
-            .unwrap_or(false)
-        {
-            out.push(p);
+    fn visit(dir: &Path, out: &mut Vec<PathBuf>, depth: u8) {
+        use std::os::windows::fs::MetadataExt;
+        if depth == 0 || !ordinary_directory(dir) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(info) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if info.file_attributes() & 0x400 != 0 {
+                continue;
+            }
+            if info.is_dir() {
+                visit(&path, out, depth - 1);
+            } else if info.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ini"))
+            {
+                out.push(path);
+            }
         }
     }
+    visit(dir, out, 8);
 }
 
 /// Resolve an explicit `profile=` value into candidates.
@@ -714,7 +908,7 @@ fn explicit_candidates(value: &str) -> Vec<Candidate> {
     // Bare name: profiles/<name>/ first, then profiles/<name>.ini.
     let base = profiles_dir();
     let dir = base.join(value);
-    if dir.is_dir() {
+    if ordinary_directory(&dir) {
         let mut files = Vec::new();
         ini_files(&dir, &mut files);
         files.sort();
@@ -750,7 +944,7 @@ fn candidates(cfg: &Config, exe: &str) -> Vec<Candidate> {
 
     let mut out = Vec::new();
     let dir = profiles_dir().join(exe);
-    if dir.is_dir() {
+    if ordinary_directory(&dir) {
         let mut files = Vec::new();
         ini_files(&dir, &mut files);
         files.sort();
@@ -786,17 +980,17 @@ fn candidate_owner(c: &Candidate, p: &Profile) -> Result<(), String> {
     // The exe field must agree with the folder (or file) it was found in. This
     // catches copy-paste and "dropped in the wrong folder" mistakes.
     let expected = if let Some(path) = &c.file {
-        let parent = path.parent().unwrap_or(Path::new(""));
-        let parent_name = parent
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if parent_name.eq_ignore_ascii_case(PROFILE_DIR) {
+        let relative = path
+            .strip_prefix(profiles_dir())
+            .map_err(|_| "profile is outside profiles directory")?;
+        let mut components = relative.components();
+        let first = components.next().ok_or("invalid profile path")?;
+        if components.next().is_some() {
+            first.as_os_str().to_string_lossy().into_owned()
+        } else {
             path.file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default()
-        } else {
-            parent_name
         }
     } else {
         String::new()
@@ -813,22 +1007,26 @@ fn candidate_owner(c: &Candidate, p: &Profile) -> Result<(), String> {
 /// Two candidates for the same build with the same facts are the same profile
 /// (e.g. the shipped `profiles/` copy and the embedded copy). They must not
 /// make selection ambiguous.
-fn same_facts(a: &Profile, b: &Profile) -> bool {
+pub(crate) fn same_facts(a: &Profile, b: &Profile) -> bool {
     a.exe.eq_ignore_ascii_case(&b.exe)
         && a.build.eq_ignore_ascii_case(&b.build)
         && a.status == b.status
         && a.image_size == b.image_size
         && a.pe_timestamp == b.pe_timestamp
         && a.text_fnv1a == b.text_fnv1a
-        && a.slots.close_window == b.slots.close_window
-        && a.slots.get_system_metrics == b.slots.get_system_metrics
-        && a.slots.change_display == b.slots.change_display
-        && a.slots.get_cursor_pos == b.slots.get_cursor_pos
+        && a.slots == b.slots
         && a.canvas == b.canvas
         && a.scene == b.scene
         && a.rtti == b.rtti
         && a.los == b.los
+        && a.terrain == b.terrain
         && a.range == b.range
+}
+
+pub(crate) fn matches_build(p: &Profile, size: u32, timestamp: u32, hash: Option<u32>) -> bool {
+    p.image_size == size
+        && p.pe_timestamp == timestamp
+        && p.text_fnv1a.is_none_or(|want| hash == Some(want))
 }
 
 /// Outcome of profile selection.
@@ -884,13 +1082,10 @@ pub unsafe fn load(cfg: &Config) -> Selection {
         }
 
         let mut unique: Vec<(Candidate, Profile)> = Vec::new();
-        for (c, p) in parsed.into_iter().filter(|(_, p)| {
-            p.image_size == size
-                && p.pe_timestamp == ts
-                && p.text_fnv1a
-                    .map(|want| hash.map(|got| got == want).unwrap_or(false))
-                    .unwrap_or(true)
-        }) {
+        for (c, p) in parsed
+            .into_iter()
+            .filter(|(_, p)| matches_build(p, size, ts, hash))
+        {
             if unique.iter().any(|(_, q)| same_facts(q, &p)) {
                 continue;
             }
@@ -906,7 +1101,7 @@ pub unsafe fn load(cfg: &Config) -> Selection {
                 ));
             }
             if PROFILE.set(p.clone()).is_ok() {
-                PROFILE_OK.store(1, Ordering::Relaxed);
+                PROFILE_OK.store(1, Ordering::Release);
             }
             Selection::Matched(p)
         } else if unique.len() > 1 {
@@ -982,6 +1177,83 @@ app_hwnd_off = 0xbac
 [rtti]
 GameView = 0x00826340
 ";
+
+    #[test]
+    fn offline_profile_validation() {
+        let root = std::env::var_os("COKE_VALIDATE_PROFILES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("profiles"));
+        let mut files = Vec::new();
+        ini_files(&root, &mut files);
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "no profile INIs found in {}",
+            root.display()
+        );
+        let mut validated: Vec<Profile> = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let mut section = String::new();
+            let mut keys = std::collections::BTreeSet::new();
+            for (i, raw) in text.lines().enumerate() {
+                let line = ini_content(raw);
+                if let Some(name) = ini_section(line) {
+                    section = name.to_ascii_lowercase();
+                } else if let Some((key, _)) = line.split_once('=') {
+                    let key = key.trim().to_ascii_lowercase();
+                    assert!(
+                        keys.insert((section.clone(), key.clone())),
+                        "{}:{}: duplicate [{section}] {key}",
+                        path.display(),
+                        i + 1
+                    );
+                }
+            }
+            let source = path.display().to_string();
+            let p = parse(&text, &source).unwrap_or_else(|e| panic!("{source}: {e}"));
+            validate_addresses(&p).unwrap_or_else(|e| panic!("{source}: {e}"));
+            let relative = path.strip_prefix(&root).unwrap();
+            if relative.components().count() >= 2 {
+                let folder = relative.components().next().unwrap();
+                assert!(
+                    folder
+                        .as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&p.exe),
+                    "{source}: profile exe '{}' disagrees with its folder",
+                    p.exe
+                );
+            }
+            for other in &validated {
+                let overlap = p.image_size == other.image_size
+                    && p.pe_timestamp == other.pe_timestamp
+                    && (p.text_fnv1a == other.text_fnv1a
+                        || p.text_fnv1a.is_none()
+                        || other.text_fnv1a.is_none());
+                assert!(
+                    !overlap || same_facts(&p, other),
+                    "{source}: identity can also match {}",
+                    other.source
+                );
+            }
+            let range_ready = p.range.is_some()
+                && (p.terrain.is_some() || p.los.is_some())
+                && p.scene.as_ref().is_some_and(|scene| scene.owner_ptr != 0);
+            println!(
+                "{source} [{}] blocks={} range={}",
+                p.build,
+                p.blocks(),
+                if range_ready {
+                    "profiled"
+                } else {
+                    "prerequisites absent"
+                }
+            );
+            validated.push(p);
+        }
+    }
 
     #[test]
     fn parses_all_blocks() {
