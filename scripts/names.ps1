@@ -26,7 +26,7 @@ function Get-CokeNames {
 
     foreach ($required in @(
         "product_name", "config_file", "log_file", "mod_dir", "profile_dir",
-        "profiles_zip", "temp_dir", "real_dll", "proxy_dll"
+        "profiles_zip", "temp_dir", "real_dll", "proxy_dll", "consent_prefix", "consent_suffix"
     )) {
         if (-not $values.ContainsKey($required)) {
             throw "names.ini: missing required key '$required'"

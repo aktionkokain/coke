@@ -27,6 +27,7 @@ ghidra-project/
 cmbs-*.bin
 *.c
 !src/**/*.c
+!tests/support/host_abi.c
 
 # Runtime mod folder created next to the game EXE
 coke/
@@ -40,4 +41,6 @@ docs/meta/ISSUES.md
 # to dist/PROFILES.zip, and that same zip is uploaded to releases. Only drop-in
 # release artifacts belong here; compiler output stays in target/.
 /dist/staging/
+/.coke-package-*/
 handoff.md
+/temp

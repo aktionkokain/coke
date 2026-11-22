@@ -1,8 +1,6 @@
 name: release
 
-# Builds the proxy and the default mods, then publishes a GitHub release with the
-# release layout from scripts/package.ps1: the proxy DLL, the default config, one
-# PROFILES.zip with every game title's profiles, and coke-mods.zip (dist\mods).
+# Publish the verified release layout from scripts/package.ps1.
 on:
   push:
     tags: ["v*"]
@@ -22,6 +20,17 @@ jobs:
         with:
           targets: i686-pc-windows-msvc
 
+      - name: Verify release tag matches the updater version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read Cargo package metadata' }
+          $version = ($metadata.packages | Where-Object name -eq 'coke').version
+          if ($env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Release tag $env:GITHUB_REF_NAME must match Cargo version v$version"
+          }
+
       # package.ps1 builds the proxy and every default mod for i686 before it
       # stages dist\, so a fresh runner has the mod DLLs it needs.
       - name: Build release layout
@@ -34,8 +43,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $modsZip = Join-Path $env:RUNNER_TEMP "coke-mods.zip"
-          Compress-Archive -Path (Join-Path $PWD "dist/mods/*") -DestinationPath $modsZip -Force
-          $assets = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }) + $modsZip
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName })
           gh release create $tag $assets --title $tag --generate-notes

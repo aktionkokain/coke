@@ -7,11 +7,14 @@ param(
     [string]$GameDir = "",
     # Executable name, e.g. "CM Cold War.exe". Detected when omitted.
     [string]$Exe = "",
-    [switch]$WithMods
+    [switch]$WithMods,
+    [switch]$ResetConfig,
+    [switch]$ReplaceProfiles,
+    [switch]$Preview
 )
 
 $ErrorActionPreference = "Stop"
-. (Join-Path $PSScriptRoot "names.ps1")
+. (Join-Path $PSScriptRoot "mods.ps1")
 $names = Get-CokeNames
 
 if (-not $GameDir) {
@@ -38,103 +41,59 @@ if (-not $Exe) {
     $Exe = $candidate.Name
 }
 
+if ([IO.Path]::GetFileName($Exe) -ne $Exe) {
+    throw "Pass an executable name for -Exe, without a directory."
+}
+$GameDir = (Resolve-Path -LiteralPath $GameDir).ProviderPath
 $exePath = Join-Path $GameDir $Exe
 if (-not (Test-Path $exePath)) {
     throw "$Exe was not found in '$GameDir'."
 }
 
-Copy-Item $dll (Join-Path $GameDir $names.proxy_dll) -Force
-
-# The config carries the update-check state in its [state] section. Keep those
-# key/values across deployments instead of resetting the player's answer, and
-# make sure the installed file has exactly one [state] section.
-$configPath = Join-Path $GameDir $names.config_file
-$state = [ordered]@{}
-if (Test-Path -LiteralPath $configPath) {
-    $inState = $false
-    foreach ($line in Get-Content -LiteralPath $configPath) {
-        $trimmed = $line.Trim()
-        if ($trimmed -match '^\[(.+)\]$') {
-            $inState = ($Matches[1].Trim() -ieq 'state')
-            continue
-        }
-        if ($inState -and $trimmed -match '^([A-Za-z0-9_]+)\s*=\s*(.*)$') {
-            $state[$Matches[1]] = $Matches[2].Trim()
-        }
-    }
-}
-Copy-Item (Join-Path $root $names.config_file) $configPath -Force
-if ($state.Count -gt 0) {
-    $kept = @()
-    $inState = $false
-    foreach ($line in Get-Content -LiteralPath $configPath) {
-        $trimmed = $line.Trim()
-        if ($trimmed -match '^\[(.+)\]$') {
-            $inState = ($Matches[1].Trim() -ieq 'state')
-            if ($inState) { continue }
-        }
-        if ($inState) { continue }
-        $kept += $line
-    }
-    while ($kept.Count -gt 0 -and $kept[-1].Trim() -eq '') {
-        if ($kept.Count -eq 1) { $kept = @(); break }
-        $kept = $kept[0..($kept.Count - 2)]
-    }
-    $block = @('', '[state]', '# Written by Coke. Delete this section to see the update prompt again.')
-    foreach ($key in $state.Keys) { $block += "$key=$($state[$key])" }
-    $kept += $block
-    [IO.File]::WriteAllText($configPath, (($kept -join [Environment]::NewLine) + [Environment]::NewLine))
-    Write-Host "Kept the [state] section in $($names.config_file)"
-}
-Write-Host "Installed $($names.proxy_dll) and $($names.config_file) in $GameDir"
-
-# The profile for this executable. CMBS also ships one embedded, but copying the
-# file next to the game makes the selected identity visible and easy to inspect.
 $profileSrc = Join-Path $root "$($names.profile_dir)\$Exe"
-if (Test-Path $profileSrc) {
-    $profileDst = Join-Path $GameDir "$($names.profile_dir)\$Exe"
-    New-Item -ItemType Directory -Path $profileDst -Force | Out-Null
-    Copy-Item (Join-Path $profileSrc "*.ini") $profileDst -Force
-    Write-Host "Installed profile(s) in $($names.profile_dir)\$Exe"
-} else {
-    Write-Host "No profile for '$Exe' in $($names.profile_dir)\; the game will run in safe mode (no engine writes)."
+$profileDst = Join-Path $GameDir "$($names.profile_dir)\$Exe"
+$configPath = Join-Path $GameDir $names.config_file
+$legacyConfig = @($names.legacy_config_files -split ',' | ForEach-Object { $_.Trim() } | Where-Object { Test-Path -LiteralPath (Join-Path $GameDir $_) })
+$writeConfig = $ResetConfig -or (-not (Test-Path -LiteralPath $configPath) -and $legacyConfig.Count -eq 0)
+Write-Host "Deploying for $exePath"
+Write-Host "Copy $dll to $GameDir"
+if ($writeConfig) { Write-Host "Install default config at $configPath" }
+else { Write-Host "Keep existing config in $GameDir" }
+if (-not $Preview) {
+    Copy-Item -LiteralPath $dll -Destination (Join-Path $GameDir $names.proxy_dll) -Force
+    if ($writeConfig) {
+        Copy-Item -LiteralPath (Join-Path $root $names.config_file) -Destination $configPath -Force
+    }
 }
 
-$coke = Join-Path $GameDir $names.mod_dir
-New-Item -ItemType Directory -Path $coke -Force | Out-Null
+if (Test-Path -LiteralPath $profileSrc) {
+    foreach ($file in Get-ChildItem -LiteralPath $profileSrc -File -Filter "*.ini" -Recurse) {
+        $destination = Join-Path $profileDst $file.FullName.Substring($profileSrc.Length + 1)
+        if ($ReplaceProfiles -or -not (Test-Path -LiteralPath $destination)) {
+            Write-Host "Copy profile $($file.FullName) to $destination"
+            if (-not $Preview) {
+                New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+                Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+            }
+        } else {
+            Write-Host "Keep profile $destination"
+        }
+    }
+} else {
+    Write-Host "No bundled profiles for $Exe"
+}
 
 if ($WithMods) {
-    $mods = @()
-    if ($WithMods) {
-        $mods += @(
-            @{ Dir = "coke-fps"; Dll = "coke_fps.dll"; Ini = $null },
-            @{ Dir = "coke-los"; Dll = "cokelos.dll"; Ini = "cokelos.ini" },
-            @{ Dir = "coke-range"; Dll = "coke_range.dll"; Ini = $null },
-            @{ Dir = "coke-prof"; Dll = "coke_prof.dll"; Ini = "coke-prof.ini" },
-            @{ Dir = "coke-camera"; Dll = "coke_camera.dll"; Ini = "coke-camera.ini" }
-        )
-    }
-    foreach ($mod in $mods) {
-        $modDll = Join-Path $root "mods\$($mod.Dir)\target\i686-pc-windows-msvc\release\$($mod.Dll)"
-        if (Test-Path $modDll) {
-            Copy-Item $modDll $coke -Force
-            $stem = [System.IO.Path]::GetFileNameWithoutExtension($mod.Dll)
-            Write-Host "Copied $($mod.Dll) to coke\"
-            Write-Host "  to enable it, create coke\user_consent_$stem.txt (empty is fine)"
-            if ($mod.Ini) {
-                $modIni = Join-Path $root "mods\$($mod.Dir)\$($mod.Ini)"
-                if (Test-Path -LiteralPath $modIni) {
-                    Copy-Item $modIni $coke -Force
-                }
-            }
+    $coke = Join-Path $GameDir $names.mod_dir
+    foreach ($mod in Get-CokeMods) {
+        Write-Host "Copy $($mod.Stem).dll to $coke"
+        if ($mod.Config) {
+            $modConfig = Join-Path $coke $mod.Config
+            if (Test-Path -LiteralPath $modConfig) { Write-Host "Keep mod settings at $modConfig" }
+            else { Write-Host "Install mod settings at $modConfig" }
         }
     }
-    $profIni = Join-Path $root "mods\coke-prof\coke-prof.ini"
-    if (Test-Path $profIni) {
-        Copy-Item $profIni (Join-Path $GameDir "coke-prof.ini") -Force
-        Copy-Item $profIni (Join-Path $coke "coke-prof.ini") -Force
+    if (-not $Preview) {
+        Copy-CokeMods -Destination $coke -NoConsent -PreserveConfig
     }
 }
-
-Write-Host ""
-Write-Host "Uninstall: delete $($names.proxy_dll), $($names.config_file) and $($names.profile_dir)\ from the game folder."

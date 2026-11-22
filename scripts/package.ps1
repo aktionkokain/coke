@@ -3,7 +3,8 @@
 #   dist\<proxy dll>        the proxy
 #   dist\<config file>      the default config
 #   dist\<profiles zip>     every title's profiles in one drag-and-drop zip
-#   dist\mods\              the default mods with their .ini and consent files
+#   dist\coke-mods.zip      all bundled mods
+#   dist\mods\              the unpacked mod bundle
 #
 # The profiles zip contains one folder per executable name
 # (e.g. `CM Black Sea.exe\steam-32.ini`). The proxy creates profiles\ and
@@ -19,8 +20,10 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "mods.ps1")
 $names = Get-CokeNames
 
-$root = Split-Path -Parent $PSScriptRoot
-$dist = Join-Path $root "dist"
+$root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$published = Join-Path $root "dist"
+$work = Join-Path $root (".coke-package-" + [guid]::NewGuid().ToString("N"))
+$dist = Join-Path $work "release"
 $target = Join-Path $root "target\i686-pc-windows-msvc\release"
 $dll = Join-Path $target $names.proxy_dll
 
@@ -33,43 +36,84 @@ if (-not (Test-Path -LiteralPath $dll)) {
     throw "Missing $dll. Run scripts\build.ps1 first."
 }
 
-if (Test-Path -LiteralPath $dist) {
-    Remove-Item -LiteralPath $dist -Recurse -Force
-}
-New-Item -ItemType Directory -Path $dist | Out-Null
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+New-Item -ItemType Directory -Path $dist -Force | Out-Null
+$backup = Join-Path $work "previous"
+try {
 
-Copy-Item $dll (Join-Path $dist $names.proxy_dll) -Force
-Copy-Item (Join-Path $root $names.config_file) (Join-Path $dist $names.config_file) -Force
+    function Assert-CokeZip {
+        param([string]$Path, [string[]]$Expected)
+        $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            $actual = @($zip.Entries | Where-Object Name | ForEach-Object { $_.FullName.Replace('\', '/') })
+            if ($actual.Count -ne $Expected.Count -or (Compare-Object $Expected $actual -CaseSensitive)) {
+                throw "Unexpected contents in $Path"
+            }
+        } finally {
+            $zip.Dispose()
+        }
+    }
 
-$modsOut = Join-Path $dist "mods"
-Copy-CokeMods -Destination $modsOut
+    Copy-Item $dll (Join-Path $dist $names.proxy_dll) -Force
+    Copy-Item (Join-Path $root $names.config_file) (Join-Path $dist $names.config_file) -Force
 
-# One zip for every profile folder. The folders sit at the zip root, so the
-# proxy's installer can drop them straight into profiles\.
-$profiles = Join-Path $root $names.profile_dir
-$staging = Join-Path $dist "staging"
-New-Item -ItemType Directory -Path $staging | Out-Null
-foreach ($dir in Get-ChildItem -LiteralPath $profiles -Directory) {
-    $inis = Get-ChildItem -LiteralPath $dir.FullName -Filter "*.ini" -File
-    if (-not $inis) { continue }
+    $modsOut = Join-Path $dist "mods"
+    Copy-CokeMods -Destination $modsOut
+    $expected = @(
+        foreach ($mod in Get-CokeMods) {
+            "$($mod.Stem).dll"
+            if ($mod.Config) { $mod.Config }
+            if ($mod.ShipConsent) { "$($names.consent_prefix)$($mod.Stem)$($names.consent_suffix)" }
+        }
+    )
+    $modsZip = Join-Path $dist "coke-mods.zip"
+    Compress-Archive -Path (Join-Path $modsOut "*") -DestinationPath $modsZip
+    Assert-CokeZip $modsZip $expected
 
-    $stagingProfile = Join-Path $staging $dir.Name
-    New-Item -ItemType Directory -Path $stagingProfile -Force | Out-Null
-    Copy-Item (Join-Path $dir.FullName "*.ini") $stagingProfile -Force
-}
+    # One zip for every profile folder. The folders sit at the zip root, so the
+    # proxy's installer can drop them straight into profiles\.
+    $profiles = Join-Path $root $names.profile_dir
+    $staging = Join-Path $work "profiles"
+    New-Item -ItemType Directory -Path $staging | Out-Null
+    foreach ($file in Get-ChildItem -LiteralPath $profiles -Filter "*.ini" -File -Recurse) {
+        $relative = $file.FullName.Substring($profiles.Length + 1)
+        if ($relative -notmatch '[\\/]') { continue }
+        $destination = Join-Path $staging $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $destination
+    }
 
-$profilesZip = Join-Path $dist $names.profiles_zip
-Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $profilesZip -Force
-Remove-Item -LiteralPath $staging -Recurse -Force
+    $profilesZip = Join-Path $dist $names.profiles_zip
+    Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $profilesZip -Force
+    Assert-CokeZip $profilesZip @(Get-ChildItem -LiteralPath $staging -File -Recurse | ForEach-Object {
+        $_.FullName.Substring($staging.Length + 1).Replace('\', '/')
+    })
 
-Write-Host ""
-Write-Host "Release layout in $dist"
-Get-ChildItem -LiteralPath $dist -File | ForEach-Object {
-    $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.Substring(0, 16)
-    "{0,-24} {1,10} bytes  sha256:{2}..." -f $_.Name, $_.Length, $hash
-}
-Write-Host "mods\"
-Get-ChildItem -LiteralPath $modsOut -File | ForEach-Object {
-    $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.Substring(0, 16)
-    "  {0,-24} {1,10} bytes  sha256:{2}..." -f $_.Name, $_.Length, $hash
+    Get-ChildItem -LiteralPath $dist -File | Sort-Object Name | ForEach-Object {
+        "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+    } | Set-Content -LiteralPath (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii
+
+    if (Test-Path -LiteralPath $published) {
+        if ((Get-Item -LiteralPath $published -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Release destination is a reparse point: $published"
+        }
+        [IO.Directory]::Move($published, $backup)
+    }
+    try {
+        [IO.Directory]::Move($dist, $published)
+    } catch {
+        if (Test-Path -LiteralPath $backup) { [IO.Directory]::Move($backup, $published) }
+        throw
+    }
+    Write-Host "Verified release layout in $published"
+} finally {
+    $resolvedWork = (Resolve-Path -LiteralPath $work).ProviderPath
+    $workName = [IO.Path]::GetFileName($resolvedWork)
+    if ([IO.Path]::GetDirectoryName($resolvedWork) -eq $root -and $workName -match '^\.coke-package-[0-9a-f]{32}$') {
+        if ((Test-Path -LiteralPath $dist) -and (Test-Path -LiteralPath $backup)) {
+            Write-Warning "Previous release is still at $backup"
+        } else {
+            Remove-Item -LiteralPath $resolvedWork -Recurse -Force
+        }
+    }
 }

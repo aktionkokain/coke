@@ -11,48 +11,68 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (32-bit MSVC target)
+      - name: Install stable Rust and the x86 target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-pc-windows-msvc
           components: rustfmt, clippy
 
-      - name: Format check
+      - name: Format, lint and test the proxy and host ABI
+        shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo fmt --check
           cargo fmt --check --manifest-path crates/coke-host/Cargo.toml
+          ./scripts/check-no-engine-addresses.ps1
+          cargo clippy --locked --all-targets --release -- -D warnings
+          cargo clippy --locked --manifest-path crates/coke-host/Cargo.toml -- -D warnings
+          cargo test --locked
+          cargo build --locked --release
 
-      - name: No hard-coded engine addresses
-        shell: pwsh
-        run: ./scripts/check-no-engine-addresses.ps1
-
-      - name: Clippy
-        run: |
-          cargo clippy --all-targets --release -- -D warnings
-          cargo clippy --manifest-path crates/coke-host/Cargo.toml -- -D warnings
-
-      - name: Test
-        run: cargo test
-
-      - name: Build proxy (release)
-        run: cargo build --release
-
-      - name: Build sample mods
+      - name: Format, lint and build bundled mods
         shell: pwsh
         run: |
-          Push-Location mods/coke-fps
-          cargo clippy --release -- -D warnings
-          cargo build --release
-          Pop-Location
-          Push-Location mods/coke-los
-          cargo clippy --release -- -D warnings
-          cargo build --release
-          Pop-Location
-          Push-Location mods/coke-range
-          cargo clippy --release --locked -- -D warnings
-          cargo build --release --locked
-          Pop-Location
-          Push-Location mods/coke-prof
-          cargo clippy --release -- -D warnings
-          cargo build --release
-          Pop-Location
+          $PSNativeCommandUseErrorActionPreference = $true
+          . ./scripts/mods.ps1
+          foreach ($mod in Get-CokeMods) {
+            Push-Location (Join-Path mods $mod.Name)
+            try {
+              cargo fmt --check
+              cargo clippy --locked --all-targets --release -- -D warnings
+              cargo build --locked --release
+            } finally {
+              Pop-Location
+            }
+          }
+
+      - name: Check x86 first use and OpenGL ordinals
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Path target/x86-smoke -Force | Out-Null
+          rustc --edition 2024 --target i686-pc-windows-msvc tests/support/x86_host.rs -o target/x86-smoke/host.exe
+          ./target/x86-smoke/host.exe (Resolve-Path target/i686-pc-windows-msvc/release/opengl32.dll).ProviderPath
+
+      - name: Compile the x86 C ABI fixture
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) "Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products "*" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vcvars = Join-Path $vs "VC/Auxiliary/Build/vcvarsall.bat"
+          cmd.exe /d /c "call `"$vcvars`" x86 && cl /nologo /W4 /WX /std:c11 /c tests\support\host_abi.c /Fotarget\x86-smoke\host_abi.obj"
+
+      - name: Check the offline range matcher
+        run: python -B tests/support/test_range_matcher.py
+
+      - name: Verify release archive contents and consent
+        shell: pwsh
+        run: ./scripts/package.ps1 -SkipBuild
+
+  minimum-rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: i686-pc-windows-msvc
+      - run: cargo test --locked
