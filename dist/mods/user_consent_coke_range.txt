@@ -1,1 +1,1 @@
-Coke mod consent: this file lets opengl32.dll load coke_range.dll from the game coke folder.
+Coke mod consent: this file lets opengl32.dll load coke_range.dll from the game's coke\ folder. Delete it to stop the mod loading.
