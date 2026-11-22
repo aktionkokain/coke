@@ -103,11 +103,54 @@ grid_w_off = 0xa0
 grid_h_off = 0xa4
 world_w_off = 0x04
 world_h_off = 0x08
+
+[terrain]                     ; optional: shared read-only heightfield anchors
+world_ptr = 0x0097a6ac
+map_globals = 0x00974ea4,0x00974ea8
+vt_action_map = 0x007979c8
+vt_terrain_map = 0x007ab5d4
+height_off = 0x9c
+grid_w_off = 0xa0
+grid_h_off = 0xa4
+world_w_off = 0x04
+world_h_off = 0x08
 ```
 
 Every block except `[profile]` is optional. A profile that only identifies the
 build is valid and deliberately produces safe mode with a `profile:` log line.
 Absence of `[los]` means "cokelos unavailable", not an error.
+
+`[terrain]` records only read-only world/heightfield anchors, independently of
+the fuller `[los]` block. This lets a feature reuse verified terrain access
+without making CokeLOS appear available. It enables the shared host ABI's
+`terrain` and `terrain_height` functions; camera, unit and occlusion interfaces
+still require `[los]`. `[range]` enables the CokeRange native
+preview only when the complete adapter and its dependencies are verified for
+that exact executable build. It requires the stable scene owner and terrain
+anchors, plus native trace, ribbon, point-vtable, HUD, and label addresses. These
+addresses are not portable between CM titles; never copy them from CMBS into
+another profile. See the CokeRange port procedure in
+[`docs/ai/PORTING.md`](../docs/ai/PORTING.md#porting-cokerange).
+
+```ini
+[range]                       ; optional; only after native validation
+command_states = 0x1          ; bit N allows world command state N (default: 0)
+draw_call = 0x001d4013        ; verified CMBS example, not a template value
+draw_flush = 0x0039ad80
+trace = 0x002145c0
+ribbon = 0x003b0950
+point_vtable = 0x00796f20
+hud_call = 0x001d41e9
+hud_draw = 0x001d42a0
+label_draw = 0x00210740
+label_width = 0x00210130
+label_background = 0x003e44a0
+```
+
+The range host API is available from ABI v7. ABI v8 adds
+`range_capabilities()`; use `RANGE_CAP_PROFILED` to check for a matched native
+adapter and `RANGE_CAP_HOOK_INSTALLED` to check that both render hooks passed
+runtime call-byte validation.
 
 `[scene]` needs one way to reach the widget that owns the 3D scene. Prefer the
 stable `owner_ptr -> owner_widget_off -> widget` chain. When a build keeps the

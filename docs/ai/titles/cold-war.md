@@ -47,7 +47,7 @@ profile; the `widget_class` fallback is the intended anchor for this title.
 | `[canvas]` | `app_ptr = 0x00a73e24`, `app_hwnd_off = 0xbac`, `size_tolerance_pct = 0` |
 | `[scene]` | `widget_class = GameView`, `top_inset = 155` |
 | `[rtti]` | `View 0x00836a08`, `GameView 0x00826340`, `CommandView 0x008233a8`, `UnitView 0x00835b8c`, `SoldierView 0x00834488`, `CommandButtonPanel 0x008237d4` |
-| `[slots]` | omitted; the generic IAT scanner validates all four user32 slots |
+| `[slots]` | Omitted. Slot hooks depend on verified named imports. |
 | `[los]` | omitted; `cokelos` stays unavailable |
 
 ## Identity

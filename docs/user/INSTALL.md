@@ -59,6 +59,16 @@ profiles\         build profiles, extracted from PROFILES.zip
 `PROFILES.zip` is only read at startup. You can delete it after the first launch,
 or leave it in place to reinstall the profiles later.
 
+### Release and profile checks
+
+If you opt in to update checks, Coke checks the latest GitHub release when the
+game starts. **Open release** takes you to that version's download page. If
+automatic profile discovery found no match, Coke can inspect the release's
+`PROFILES.zip` in memory for your exact game build. When the running Coke version
+already matches the release, **Download profiles** opens the archive in your
+browser. Place it next to the game executable and restart. Existing profile files
+are preserved when the game extracts the archive.
+
 ### Uninstall
 
 Delete `opengl32.dll`, `coke_config.ini` and `PROFILES.zip`. You can also delete
@@ -72,10 +82,14 @@ untouched.
 4. Open an issue and attach `coke.log` plus your Windows version and game
    build (Steam or GOG).
 
-To rule out the proxy, set `profile=none` in `coke_config.ini`. The proxy then
-runs in safe mode, which keeps the window, `F11` and the FPS counter but writes
-nothing to the game. If the problem also happens without the proxy, it is a game
-or driver problem.
+Set `profile=none` in `coke_config.ini` to disable engine patches. Window
+controls and consented mods are still available. For recovery with native mods
+disabled as well, launch the game with the environment variable
+`COKE_SAFE_START=1`.
+
+Deployment preserves existing config and profiles by default.
+`scripts/deploy.ps1 -GameDir <path> -Preview` shows what would be copied.
+Use `-ResetConfig` or `-ReplaceProfiles` to replace the corresponding files.
 
 ## 2. Install a mod
 
@@ -116,9 +130,9 @@ coke\coke_fps.dll
 coke\user_consent_coke_fps.txt
 ```
 
-The release ships every mod in `dist\mods\`, each with its own
-`user_consent_*.txt` and optional `.ini`. Copy the files from `dist\mods\` into
-`coke\` to install them all at once, including Coke Shot.
+Extract `coke-mods.zip` into `coke\` to install the bundled mods, including
+Coke Shot. Create an empty `user_consent_coke_camera.txt` in `coke\` to enable
+Coke Shot.
 
 ## 3. Install a build profile
 

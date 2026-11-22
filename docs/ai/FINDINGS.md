@@ -111,6 +111,19 @@ Support matrix (one row per profile; see `profiles/README.md`):
 | CM Cold War, GOG 32-bit | `gog-32` (verified) | yes | yes | yes | yes | yes |
 | any other build | none -> safe mode | yes | no | no | no | yes |
 
+Native range support is tracked separately from the general proxy/mod-loader
+matrix:
+
+| Build | CokeRange | Evidence |
+|---|---|---|
+| CM Black Sea, Steam 32-bit | supported | `[range]` and `[los]` profile; native Target preview and experimental terrain-paint hook documented in [title notes](titles/black-sea.md) |
+| CM Shock Force 2, GOG 32-bit | supported | `[range]` and `[terrain]` profile, verified clear and blocked preview in a live battle |
+| CM Cold War, GOG 32-bit | unavailable | native trace/draw adapter not yet verified |
+
+The range ABI is title-neutral; engine adapters remain build-specific. API v8's
+`range_capabilities` distinguishes a configured adapter from an installed
+native hook. Never infer `[range]` addresses from a neighboring title.
+
 A `partial` profile is a valid, honest result: the proxy logs
 `profile: ... status=partial`, lists the missing blocks, and writes nothing to
 the engine.
@@ -132,10 +145,10 @@ Current known problems, in priority order:
 1. **Poor performance from the engine's single-thread lock.** The game's
    render/UI/simulation work is effectively serialized on one thread and the
    renderer is CPU-heavy. The proxy does not move rendering to the GPU.
-2. **`cokelos` is broken.** It can produce stuck frames while the camera moves,
-   can spill outside the world bounds, and its whole-map scan is expensive
-   enough to contribute to crashes. It is disabled by default and needs
-   additional RE (terrain handing, projection, object occluders).
+2. **LOS terrain paint is approximate.** CokeRange now paints the host's
+   terrain-only visibility result through the native terrain color grid. It
+   does not model trees, buildings, smoke or spotting. The previous standalone
+   CokeLOS DLL is no longer included in the release bundle.
 3. Mid-battle resizes still have layout limits: the engine has no runtime
    battle re-layout, and some screen geometry is frozen at battle entry.
 4. **DPI scaling is not handled.** The process inherits whatever DPI
@@ -191,8 +204,8 @@ EXE. Useful lines:
 - input: `mouse ...`, `click ...`, `GetCursorPos ...`
 - FPS: `fps: ...`
 
-`F9` dumps the live widget tree. `Ctrl+Shift+D` in `cokelos` dumps LOS/map
-data. Both dumps are read-only.
+`F9` dumps the live widget tree. The retired standalone `cokelos` source has a
+read-only `Ctrl+Shift+D` diagnostic, but that DLL is no longer bundled.
 
 ### Iteration rules
 
@@ -211,8 +224,8 @@ data. Both dumps are read-only.
 ### Re-finding addresses on another build
 
 Fixed addresses are safe only when the module base and image size match. The
-proxy already validates this and falls back to an IAT scan; new engine-object
-work should do the same. Useful stable anchors:
+proxy verifies the build identity and the current pointer value before patching an
+import. The diagnostic scan reports candidate RVAs for packed builds. Useful anchors:
 
 - RTTI names: `View`, `GameView`, `CommandView`, `UnitView`, `SoldierView`,
   `CommandButtonPanel`, `MapView`, `Camera`.
@@ -641,13 +654,13 @@ Threading contract:
 - `coke_init` must reject hosts with `api_version < 2` or a `size` smaller than
   the struct it was compiled against.
 
-`CokeHost` v4 fields. v1 is the first block; v2, v2.1 and v4 are appended, so a
+`CokeHost` v8 fields. v1 is the first block; later versions are appended, so a
 mod must check `api_version` and `size` before touching anything past the block
 it was compiled against. The actual field order is:
 
 | Group | Field | Purpose |
 |---|---|---|
-| v1 | `api_version` | ABI version (currently `4`) |
+| v1 | `api_version` | ABI version (currently `8`) |
 | v1 | `log`, `draw_text` | Host log and 2D text overlay |
 | v1 | `get_width`, `get_height`, `get_fps` | Physical client size and cached FPS |
 | v2 | `size` | Size of the host struct in bytes |
@@ -668,12 +681,16 @@ it was compiled against. The actual field order is:
 | v2.1 | `los_scan_map` | Whole-map visibility grid |
 | v4 | `register_hotkey` | Register an F1-F12 callback with the host bus |
 | v4 | `set_layer` | Per-mod draw layer, applied to `coke_frame` and `coke_hud` |
+| v5 | `camera_apply`, `camera_wheel_delta`, `camera_input_capture` | Validated camera controls |
+| v7 | `range_control`, `range_read` | Shared native range preview control and result |
+| v8 | `range_capabilities` | Matched-build adapter and installed-hook flags |
 
 A v1 mod can read `api_version`, `log`, `draw_text`, `get_width`, `get_height`
 and `get_fps` and nothing else. `mods/coke-fps` uses the v1 prefix, the v3 HUD
 split and the v4 hotkey bus when present, and falls back to drawing without a
 toggle on older hosts. `mods/coke-los` checks `api_version >= 2` and `size`
-before using the v2/v2.1 tail. The authoritative definition is
+before using the v2/v2.1 tail. Range API consumers should check the appended
+field size before reading `range_capabilities`. The authoritative definition is
 `crates/coke-host/src/lib.rs`, shared by the proxy and every mod.
 
 Overlay drawing is submitted at the swap point and is not composited into
@@ -765,9 +782,12 @@ preferred base     0x00400000   (on disk; the live image is rebased)
 ```
 
 The profile has all four `[slots]`, `[canvas]`, `[scene]` and six `[rtti]`
-entries and is `status=verified`. It has no `[los]` block, so `cokelos` stays
-unavailable on that build. [titles/shock-force-2.md](titles/shock-force-2.md)
-has the offsets, the evidence and the two bugs fixed during the port.
+entries and is `status=verified`. It has a separate `[terrain]` block with
+live-validated SF2 world and ActionMap anchors. CokeRange uses the SF2
+`[range]` adapter for the same native trace and rendering routines used by
+Target. CokeLOS still requires its own `[los]` block. See the
+[SF2 evidence](titles/shock-force-2.md#native-range-adapter-2026-11-22)
+and the [CokeRange porting guide](RANGE-PORTING.md).
 
 ### Cold War (GOG 32-bit)
 

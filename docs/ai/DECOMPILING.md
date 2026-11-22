@@ -202,7 +202,7 @@ already owns fault-safe reads and the class table.
 | Fact | Source | Ghidra? |
 |---|---|---|
 | Build identity (`image`, `ts`, `text_fnv1a`) | `profile_dump=1` | no |
-| user32 IAT slot RVAs | log line `IAT scan: <name> slot=... rva=...` | no |
+| user32 IAT slot RVAs | log line `IAT scan: <name> candidate RVA 0x...` | no |
 | RTTI vtables for the six profile classes | log line `rtti: class table resolved by name: ...`, minus the module base | no |
 | Cached canvas (`app[0]`, `app[4]`) | the two `GetSystemMetrics` stores | yes |
 | Battle scene owner/render target | battle screen constructor; F9 widget dump for the `widget_class` fallback | yes |

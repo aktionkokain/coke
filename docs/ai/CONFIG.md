@@ -380,14 +380,17 @@ Alt+Tab entry. Clicking the game leaves it open instead of discarding it, so you
 can come back to it. Only the close box or Escape dismisses it; that records
 nothing, so the question returns on the next launch.
 
-With consent, a background thread requests the public GitHub release list once
-per game launch (no daily throttle), using WinHTTP and the system certificate
-store. It sends no personal data, identifiers or telemetry. A newer tag shows a
-three-button window: **Download** opens
-`github.com/aktionkokain/coke/releases` in the default browser, **Ignore this
-version** records the tag, and **Never check again** disables future checks.
-Coke never downloads or replaces its own DLL. Dismissing that notice records
-nothing and leaves the choice for later.
+With consent, a background thread requests the latest public GitHub release
+once per game launch, using WinHTTP and the system certificate store. When
+automatic discovery has no matching profile, Coke also checks that release's
+`PROFILES.zip` in memory. It compares the executable name and build identity
+locally. **Download profiles** opens the archive in your browser if it matches
+the game and belongs to your current Coke version.
+
+For a newer version, **Open release** opens that version's page in your default
+browser, **Ignore this version** records the tag, and **Never check again**
+disables future checks. Installation is manual. Dismissing the notice leaves
+the choice for later.
 
 The `[state]` section is written by the proxy and safe to delete; deleting it
 makes the consent prompt appear again. It holds only `update_consent`,
@@ -689,6 +692,21 @@ counter under `show_fps` control only.
 fps_hotkey=F10
 ```
 
+### `range_terrain_overlay_test`
+
+- **Default:** `1` in the shipped config (`0` in the compiled fallback)
+- **Values:** `0` or `1`
+- **Restart required:** yes
+
+Enable the CM:BS terrain painter in CokeRange. With the matching Black Sea
+profile, aim at a visible surface and press `Ctrl+Shift+T`. The painter uses
+the battle depth buffer to pick an observer and queries native visibility for
+the entire playable map in 16 m cells, with 8 m detail near the observer.
+Very large maps use coarser cells to stay within the scan limit.
+Visible ground is green and blocked ground is red at both terrain detail
+levels. Press the combination again to clear the paint. See the
+[CM:BS title note](titles/black-sea.md#deployment-tint-and-terrain-overlay-prototype).
+
 ### `los_flip_x` / `los_flip_y`
 
 - **Default:** `0` / `0`
@@ -730,29 +748,12 @@ los_clip_bottom_pct=17
 
 ---
 
-## `cokelos.ini`
+## CokeRange LOS paint
 
-`cokelos` is a separate native mod, not part of the main DLL. It is **disabled
-by default**: it loads only when all of these exist:
-
-1. `coke/cokelos.dll`
-2. `coke/user_consent_cokelos.txt`
-3. `enabled=1` in `cokelos.ini`
-
-It reads `cokelos.ini` from `coke/` first, then from the game folder.
-
-| Key | Default | Range / values | Meaning |
-|---|---|---|---|
-| `enabled` | `0` | 0/1 | Opt-in gate for the mod |
-| `cell` | `8` | 2–32 m | Visibility-grid cell size; `8` matches the game's action spot |
-| `eye` | `2.0` | 0.5–10 m | Observer eye height above the ground |
-| `target_height` | `1.6` | 0–6 m | Target height used by the probe line |
-| `line_width` | `2.0` | 0.5–8 px | Contour and ray width in physical pixels |
-| `rays` | `64` | 0–720 | Radial rays from the observer; `0` draws only the contour |
-| `alpha` | `0.20` | 0–0.9 | Translucent fill of the visible region |
-| `show_blocked` | `0` | 0/1 | With a fill, draw dead zones red |
-| `show_status` | `1` | 0/1 | One-line status under the FPS counter |
-| `lane` | `1.2` | 0.2–8 m | Probe line width from the selected unit to the cursor |
-
-The overlay is toggled with `Ctrl+L` (or `Ctrl+Shift+L`), and `Ctrl+Shift+D`
-dumps LOS/map data to `coke.log`.
+LOS terrain painting is integrated into `coke_range.dll`; the release bundle
+no longer contains a separate `cokelos.dll`. The CokeRange consent file gates
+both the range preview and painter. `range_terrain_overlay_test` enables the
+matched-build terrain draw hook; `Ctrl+Shift+T` toggles the combined cursor
+terrain paint. The scan uses the game's observer and target postures. It
+samples at 16 m across the map and 8 m within 192 m of the observer, subject
+to the scan limit on large maps.

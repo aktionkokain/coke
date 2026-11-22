@@ -100,7 +100,17 @@ cargo build --release
 ```
 
 The default target is set in `.cargo/config.toml`, so `--target` is optional.
-`scripts\build.ps1` builds the proxy and the sample mods.
+`scripts\build.ps1` builds the proxy and all five mods. Run
+`scripts\package.ps1 -SkipBuild` to assemble and verify the release layout
+from those binaries.
+Run `scripts\validate-profiles.ps1` to check profile syntax, addresses and
+build identities without starting the game.
+
+The [x86 C header](../../crates/coke-host/include/coke_host.h) documents
+the native ABI and callback phases. The [C fixture](../../tests/support/host_abi.c)
+and [FPS mod](../../mods/coke-fps/src/lib.rs) show how to check the host prefix
+before using it. The proxy and accepted mods stay loaded for the process
+lifetime. Call OpenGL after Windows returns from DLL initialization.
 `scripts\deploy.ps1 -GameDir <game folder>` copies the result into that folder;
 without `-GameDir` it stops and tells you which directory it expects.
 

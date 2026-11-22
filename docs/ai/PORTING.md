@@ -17,8 +17,8 @@ Read this with:
   and the safety rules;
 - [CONFIG.md](CONFIG.md): the switches used during a port.
 
-The engine paths are generic already: IAT scanning, RTTI class lookup, window
-discovery, frame cap, VSync, priority and the mod loader. A build-specific
+The common paths cover import discovery, RTTI lookup, window discovery, frame
+pacing, VSync, process priority and the mod loader. A build-specific
 profile supplies only the engine anchors that those generic paths cannot derive.
 
 ---
@@ -32,7 +32,9 @@ profile supplies only the engine anchors that those generic paths cannot derive.
 | + `[slots]` | logical resolution, cursor mapping, alt-tab fix, display-mode suppression | import slots only |
 | + `[canvas]` | live canvas patch, native UI re-layout after resize/F11/maximize | app canvas and widget rects |
 | + `[scene]` | a stable scene widget/rect for the battle layout override, `scene_rect` API consumers and `cokelos` | scene rect |
+| + `[terrain]` | shared read-only world/heightfield access for dependent features | none |
 | + `[los]` | `cokelos` terrain overlay (opt-in) | none |
+| + `[range]` | CokeRange native Target-style preview, when that build's adapter is verified | two validated battle render call sites |
 
 The first row is a complete, useful port. A profile that only identifies the
 build is valid and performs no engine writes. Add the optional blocks one at a
@@ -45,6 +47,45 @@ keeps picking aligned. What `[scene]` adds is a named, stable scene widget: the
 battle layout override can target it, `scene_rect` returns a rect to mods, and
 `cokelos` can project against it. Add `[scene]` for those, not to make resizing
 work.
+
+### Porting CokeRange
+
+CokeRange has a [dedicated porting guide](RANGE-PORTING.md) with a reference
+comparison script, a checklist for each native call, and an in-game smoke test.
+
+CokeRange is profile-driven, but native addresses are not shared across titles
+or executable builds. A range profile is accepted only with verified build
+identity, a stable `[scene] owner_ptr`, and verified world/terrain anchors from
+`[terrain]` (or legacy `[los]` anchors). The `[range]` block supplies both native hook sites, the
+engine trace routine, and the ribbon, point, and label helpers. Do not copy the
+CMBS RVAs into SF2 or Cold War.
+
+Verify each build in this order:
+
+1. Identify the `T` target-preview call path and native visibility routine with
+   static analysis and a live trace. Confirm parameter order, calling
+   convention, and return-value meaning.
+2. Resolve the battle owner, world, map, and terrain layout. Confirm map
+   identity and dimensions in a live battle; do not infer them from neighboring
+   globals.
+3. Identify the target ribbon and HUD/label draw sites. Record their original
+   call bytes and confirm they match before installing either hook.
+4. Put the candidate `[range]` values in a local copy of the target profile.
+   Compare CokeRange with native `T` for ground, buildings, trees, map edges,
+   and both selected-unit states.
+5. Add the checked values to the shipped profile and record any untested
+   cases in the title notes.
+
+`command_states` is a bit mask on `[range]`. Bit N allows CokeRange to start
+or stay active in world command state N. It defaults to `0x1` (idle state
+zero on CMBS and SF2). Record the idle and native Target states separately so
+the game keeps dispatching its own orders when they are active.
+
+API v8 adds `range_capabilities`. `RANGE_CAP_PROFILED` means the matched profile
+contains an adapter; `RANGE_CAP_HOOK_INSTALLED` means both native hooks passed
+runtime call-byte validation. Submods should check both flags before assuming
+native drawing is available. The range API has one shared active preview, so
+plugins must coordinate ownership.
 
 ---
 
@@ -176,16 +217,16 @@ Discovery order, for reference:
 
 ## 4. Find the user32 import slots (`[slots]`)
 
-The packed CMBS image builds its import table at runtime, so a static IAT is not
-available. The proxy scans for the real user32 pointers; with `verbose=1` the
-log gives the slot RVAs directly:
+The packed CMBS image builds its imports at runtime. Use `profile_dump=1` to
+list candidate matches for known user32 pointers. Confirm each candidate in
+the target build before adding its RVA to the profile.
 
 ```text
-IAT scan: <name> slot=... rva=...
+IAT scan: <name> candidate RVA 0x...
 ```
 
-Relevant names: `close_window`, `get_system_metrics`, `change_display` and
-`get_cursor_pos`.
+Supported keys include `close_window`, `get_system_metrics`, `change_display`,
+`get_cursor_pos`, `show_window`, `show_window_async` and `get_async_key_state`.
 
 Write only the RVAs you have observed:
 
@@ -667,6 +708,6 @@ widget relayout: 0x27a683e0 (0,155,2560,1222) -> (0,155,2560,1284) scene axis=S/
 ```
 
 Play test: windowed start, F11, repeated resizes in a campaign battle, HUD
-re-layout and click-to-unit picking all passed. `[slots]` is omitted because the
-generic IAT scanner validates the four user32 slots on this build; `[los]` is
-omitted, so `cokelos` stays unavailable. The profile is `status = verified`.
+re-layout and click-to-unit picking all passed in the original port. The profile
+omits `[slots]`, so current builds require verified named imports to hook user32
+on this title. It also omits `[los]`. The profile is `status = verified`.
