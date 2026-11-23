@@ -1413,7 +1413,9 @@ unsafe fn update(native: Native) {
         } else if let Some(aim) = unsafe { cursor(&terrain, generation, pixel, now, Some(since)) } {
             let scan_origin = trace_source_origin(aim.point, state.source_height);
             let scan_stance = state.stance;
-            state.terrain_overlay.begin_scan(&terrain, scan_origin, scan_stance);
+            state
+                .terrain_overlay
+                .begin_scan(&terrain, scan_origin, scan_stance);
         }
         return;
     }

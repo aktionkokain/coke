@@ -164,12 +164,7 @@ impl Overlay {
         }
     }
 
-    pub(super) fn begin_scan(
-        &mut self,
-        terrain: &Terrain,
-        origin: CokeRangePoint,
-        stance: Stance,
-    ) {
+    pub(super) fn begin_scan(&mut self, terrain: &Terrain, origin: CokeRangePoint, stance: Stance) {
         self.scan_pick = None;
         let mut step = CHUNK_METRES;
         loop {
@@ -245,9 +240,8 @@ impl Overlay {
                         unsafe { super::terrain_height(terrain, x, y) }
                     },
                 };
-                let visible = u32::from(unsafe {
-                    trace(native, context, scan.origin, scan.stance, target)
-                });
+                let visible =
+                    u32::from(unsafe { trace(native, context, scan.origin, scan.stance, target) });
                 scan.summary.sampled += 1;
                 scan.summary.visible += visible as usize;
                 if let Some(last) = scan.tiles.last_mut()
