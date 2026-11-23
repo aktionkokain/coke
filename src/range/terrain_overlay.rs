@@ -1,5 +1,6 @@
 use super::{
-    CallPatch, Native, Point, STATE, Terrain, battle_cursor_ray, trace, trace_context, trace_ground,
+    CallPatch, Native, Point, STATE, Stance, Terrain, battle_cursor_ray, trace, trace_context,
+    trace_ground,
 };
 use crate::{
     REAL_GL_COLOR_3F, REAL_GL_DISABLE, REAL_GL_POP_ATTRIB, REAL_GL_PUSH_ATTRIB, log, profile,
@@ -81,6 +82,7 @@ pub(super) struct ScanSummary {
 
 struct Scan {
     origin: CokeRangePoint,
+    stance: Stance,
     columns: usize,
     rows: usize,
     step: f32,
@@ -162,7 +164,12 @@ impl Overlay {
         }
     }
 
-    pub(super) fn begin_scan(&mut self, terrain: &Terrain, origin: CokeRangePoint) {
+    pub(super) fn begin_scan(
+        &mut self,
+        terrain: &Terrain,
+        origin: CokeRangePoint,
+        stance: Stance,
+    ) {
         self.scan_pick = None;
         let mut step = CHUNK_METRES;
         loop {
@@ -171,6 +178,7 @@ impl Overlay {
             if columns.saturating_mul(rows) <= MAX_SCAN_CELLS {
                 self.scan = Some(Scan {
                     origin,
+                    stance,
                     columns,
                     rows,
                     step,
@@ -237,7 +245,9 @@ impl Overlay {
                         unsafe { super::terrain_height(terrain, x, y) }
                     },
                 };
-                let visible = u32::from(unsafe { trace(native, context, scan.origin, target) });
+                let visible = u32::from(unsafe {
+                    trace(native, context, scan.origin, scan.stance, target)
+                });
                 scan.summary.sampled += 1;
                 scan.summary.visible += visible as usize;
                 if let Some(last) = scan.tiles.last_mut()

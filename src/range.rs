@@ -15,10 +15,41 @@ mod terrain_overlay;
 
 const SCENE_TIMEOUT_MS: u32 = 650;
 const QUERY_INTERVAL_MS: u32 = 100;
-const OBSERVER_POSTURE: i32 = 2;
-const NATIVE_OBSERVER_HEIGHT: f32 = 1.6;
 const SOURCE_HEIGHTS: [f32; 4] = [0.25, 1.0, 2.0, 3.5];
 const TARGET_POSTURE: i32 = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stance {
+    Prone,
+    Kneeling,
+    Standing,
+}
+
+impl Stance {
+    fn native_value(self) -> i32 {
+        match self {
+            Self::Prone => 1,
+            Self::Kneeling => 2,
+            Self::Standing => 3,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prone => "Prone",
+            Self::Kneeling => "Kneeling",
+            Self::Standing => "Standing",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Prone => Self::Kneeling,
+            Self::Kneeling => Self::Standing,
+            Self::Standing => Self::Prone,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Native {
@@ -147,6 +178,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     can_start: false,
     unit_selected: false,
     source_height: SOURCE_HEIGHTS[0],
+    stance: Stance::Kneeling,
     pending: None,
     origin: None,
     result: None,
@@ -174,6 +206,7 @@ struct State {
     can_start: bool,
     unit_selected: bool,
     source_height: f32,
+    stance: Stance,
     pending: Option<Origin>,
     origin: Option<CokeRangePoint>,
     result: Option<CokeRangeResult>,
@@ -510,6 +543,19 @@ pub fn handle_message(msg: u32, value: usize, flags: isize) -> bool {
         }
         return true;
     }
+    if matches!(value, 0x50 | 0x70) {
+        if !state.active() {
+            return false;
+        }
+        if unsafe { GetKeyState(0x11) < 0 || GetKeyState(0x12) < 0 } {
+            return false;
+        }
+        if flags & (1 << 30) == 0 {
+            state.stance = state.stance.next();
+            state.last_trace = None;
+        }
+        return true;
+    }
     if !matches!(value, 0x54 | 0x74) {
         return false;
     }
@@ -800,7 +846,11 @@ unsafe extern "thiscall" fn battle_hud(view: usize) {
     if INSTALL_STATE.load(Ordering::Acquire) != INSTALL_READY || unsafe { read(&mut result) } == 0 {
         return;
     }
-    unsafe { draw_label(native, view, result) };
+    let stance = STATE
+        .try_lock()
+        .map(|state| state.stance)
+        .unwrap_or(Stance::Kneeling);
+    unsafe { draw_label(native, view, result, stance) };
 }
 
 #[repr(C)]
@@ -810,7 +860,7 @@ struct NativeText {
     capacity: u32,
 }
 
-unsafe fn draw_label(native: Native, view: usize, result: CokeRangeResult) {
+unsafe fn draw_label(native: Native, view: usize, result: CokeRangeResult, stance: Stance) {
     let Some(world) = (unsafe { range_world() }) else {
         return;
     };
@@ -856,16 +906,18 @@ unsafe fn draw_label(native: Native, view: usize, result: CokeRangeResult) {
     }
     let from_bottom = PHYS_H.load(Ordering::Relaxed) - result.cursor_y - bottom;
     let x = ((result.cursor_x - left) * width / vp_width).clamp(65, width - 65);
-    let y = (from_bottom * height / vp_height - 46).clamp(12, height - 24);
+    let y = (from_bottom * height / vp_height - 46).clamp(28, height - 40);
     let status = if result.status == RANGE_BLOCKED {
         "No Line of Sight"
     } else {
         "Ground Range"
     };
     let range = format!("Range {:.0}m", result.distance_m);
+    let stance = format!("Stance: {}", stance.label());
     unsafe {
-        print_label(native, font, x, y + 16, font_height, status);
-        print_label(native, font, x, y, font_height, &range);
+        print_label(native, font, x, y + 32, font_height, status);
+        print_label(native, font, x, y + 16, font_height, &range);
+        print_label(native, font, x, y, font_height, &stance);
     }
 }
 
@@ -1359,7 +1411,9 @@ unsafe fn update(native: Native) {
         if now.wrapping_sub(since) >= SCENE_TIMEOUT_MS {
             state.terrain_overlay.stop_scan();
         } else if let Some(aim) = unsafe { cursor(&terrain, generation, pixel, now, Some(since)) } {
-            state.terrain_overlay.begin_scan(&terrain, aim.point);
+            let scan_origin = trace_source_origin(aim.point, state.source_height);
+            let scan_stance = state.stance;
+            state.terrain_overlay.begin_scan(&terrain, scan_origin, scan_stance);
         }
         return;
     }
@@ -1407,6 +1461,7 @@ unsafe fn update(native: Native) {
             origin,
             target,
             state.source_height,
+            state.stance,
             now,
             &mut state,
         )
@@ -1446,6 +1501,7 @@ unsafe fn sample(
     origin: CokeRangePoint,
     target: CokeRangePoint,
     source_height: f32,
+    stance: Stance,
     now: u32,
     state: &mut State,
 ) -> Option<CokeRangeResult> {
@@ -1464,15 +1520,12 @@ unsafe fn sample(
     }
     let context = unsafe { trace_context(owner) }?;
     let distance = (target.x - origin.x).hypot(target.y - origin.y);
-    // Retain the native stance offset and add only the requested height delta.
-    // The public result continues to report the ground origin for ABI stability.
-    let trace_origin = CokeRangePoint {
-        z: origin.z + (source_height - NATIVE_OBSERVER_HEIGHT),
-        ..origin
-    };
+    // The native trace consumes the observer point directly. Raise it by the
+    // selected source height while keeping the public result at ground level.
+    let trace_origin = trace_source_origin(origin, source_height);
     let mut visible_fraction = 1.0;
     let mut status = RANGE_CLEAR;
-    if distance >= 0.25 && !unsafe { trace(native, context, trace_origin, target) } {
+    if distance >= 0.25 && !unsafe { trace(native, context, trace_origin, stance, target) } {
         status = RANGE_BLOCKED;
         let mut blocked = 1.0;
         visible_fraction = 0.0;
@@ -1484,6 +1537,7 @@ unsafe fn sample(
                     native,
                     context,
                     trace_origin,
+                    stance,
                     between(trace_origin, target, middle),
                 )
             } {
@@ -1505,12 +1559,25 @@ unsafe fn sample(
     Some(result)
 }
 
+fn trace_source_origin(origin: CokeRangePoint, source_height: f32) -> CokeRangePoint {
+    CokeRangePoint {
+        z: origin.z + source_height,
+        ..origin
+    }
+}
+
 unsafe fn trace_context(owner: usize) -> Option<usize> {
     let context = unsafe { rd_u32(owner + 0x1c)? } as usize;
     unsafe { committed(context, 0x54) }.then_some(context)
 }
 
-unsafe fn trace(native: Native, context: usize, a: CokeRangePoint, b: CokeRangePoint) -> bool {
+unsafe fn trace(
+    native: Native,
+    context: usize,
+    a: CokeRangePoint,
+    stance: Stance,
+    b: CokeRangePoint,
+) -> bool {
     type Trace = unsafe extern "thiscall" fn(
         usize,
         *const NativePoint,
@@ -1537,7 +1604,7 @@ unsafe fn trace(native: Native, context: usize, a: CokeRangePoint, b: CokeRangeP
         run(
             context,
             &a,
-            OBSERVER_POSTURE,
+            stance.native_value(),
             0,
             &b,
             TARGET_POSTURE,

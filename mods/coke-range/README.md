@@ -4,7 +4,7 @@ CokeRange provides a surface-to-surface rangefinder in Combat Mission Black Sea 
 
 - With the cursor over the battlefield and no unit selected, press **T** to set the origin. Move the cursor to measure to another point.
 - With a unit selected, use **Shift+T**. Bare **T** still starts the unit's Target order.
-- Press **H** while CokeRange is active to cycle the source height through **0.25 m**, **1 m**, **2 m**, and **3.5 m**. The lowest level is near ground height. CokeRange leaves **E** available to Coke Shot’s camera control. Press **T** or **Esc**, or right-click, to close CokeRange. Switching scenes, losing focus, or entering a native command clears the origin.
+- Press **H** while CokeRange is active to cycle the source height through **0.25 m**, **1 m**, **2 m**, and **3.5 m**. The selected height is added to the source point for the LOS calculation. Press **P** to cycle the observer stance through **Prone**, **Kneeling**, and **Standing**; the current stance appears with the cursor range/LOS label. CokeRange leaves **E** available to Coke Shot’s camera control. Press **T** or **Esc**, or right-click, to close CokeRange. Switching scenes, losing focus, or entering a native command clears the origin.
 
 CokeRange reads the battle render target's depth at the cursor. Walls, roofs and depth-writing foliage can become the nearest surface. The origin uses the cursor position at the key press and waits for matching depth data. Pixels without a valid sample leave the preview waiting for a visible surface. Depth readback uses pixel-buffer objects and non-blocking fences. The range ribbon and visibility verdict use the native engine. A selected unit's Target verdict can also depend on its weapons, crew, optics and spotting state.
 

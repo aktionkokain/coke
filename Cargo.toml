@@ -1,6 +1,6 @@
 [package]
 name = "coke"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # #[unsafe(naked)] and naked_asm! are stable since Rust 1.88.
 rust-version = "1.88"

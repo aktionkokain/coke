@@ -8,6 +8,11 @@ Release notes for the Coke proxy.
 
 ---
 
+## 0.1.2
+
+- CokeRange adds configurable observer stances and terrain visibility overlays.
+- Release packaging and profile support are expanded for the bundled mods.
+
 ## 0.1.1
 
 - Easier window resize: `resize_border` gives each client edge a wider grab
